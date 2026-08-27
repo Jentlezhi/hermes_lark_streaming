@@ -1,0 +1,29 @@
+# Python 字节码与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 工具缓存
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 编辑器与系统
+.DS_Store
+.idea/
+*.swp
+
+# 本地凭据：飞书 app_id / app_secret 一律走 ~/.hermes/.env 或 config.yaml，
+# 不进仓库。此处兜底，防止误把本地测试用的 .env 提交上来
+.env
+.env.*
