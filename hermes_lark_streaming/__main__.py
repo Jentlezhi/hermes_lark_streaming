@@ -827,12 +827,18 @@ def cmd_doctor() -> int:
     if hermes_py and Path(sys.executable).resolve() != hermes_py.resolve():
         suggestions.append(f"用 Hermes 自己的解释器安装本插件：{hermes_py} -m pip install -e .")
 
-    from .events.normalize import hermes_constants_available
+    from .events.normalize import hermes_constants_available, lifecycle_constants_borrowed
 
     if not hermes_constants_available():
         suggestions.append(
             "未能读取 Hermes 的压缩状态常量，状态消息分类已降级为内置规则（功能可用，"
             "识别精度略降）"
+        )
+
+    if not lifecycle_constants_borrowed():
+        suggestions.append(
+            "未能读取 Hermes 的 gateway 关闭 / 重启常量，改用内置短语表（功能可用，"
+            "但 Hermes 改这两条文案时不会自动跟随）"
         )
 
     if not suggestions:

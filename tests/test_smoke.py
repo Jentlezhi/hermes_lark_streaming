@@ -1351,6 +1351,102 @@ def test_drain_pending_finalize_schedules_one_coro_per_turn() -> None:
     assert orch.drain_pending_finalize() == 0
 
 
+def test_no_module_level_gateway_run_import() -> None:
+    """本插件任何模块都不得在**模块顶层** import ``gateway.run``.
+
+    ``gateway/run.py`` 的模块体里调用了 ``get_plugin_auxiliary_tasks()``，
+    它会触发 Hermes 的插件发现。若在模块顶层 import 它，就会形成闭环：
+
+        Hermes 加载本插件 → import 本插件模块 → import gateway.run
+          → gateway.run 模块体触发插件发现 → 再次加载本插件
+            → 本插件模块仍在初始化中，register() 尚未定义
+              → Hermes 报 "has no register() function" 并记一条加载失败
+
+    这个缺陷只在「pip 安装 + 由 Hermes 插件加载器加载」的真实形态下出现，
+    直接调 bootstrap() 的测试路径构不成闭环——所以必须靠这条静态检查守住，
+    它不依赖 Hermes 环境，任何机器上都能跑。
+    """
+    import ast
+
+    forbidden = "gateway.run"
+    root = Path(__file__).resolve().parent.parent / "hermes_lark_streaming"
+    offenders: list[str] = []
+
+    def scan(nodes: list[ast.stmt], path: Path) -> None:
+        """只扫模块级语句；函数/类体内的 import 是惰性的，不受此限。"""
+        for node in nodes:
+            if isinstance(node, ast.ImportFrom):
+                if node.module and (node.module == forbidden or node.module.startswith(forbidden + ".")):
+                    offenders.append(f"{path.name}:{node.lineno} from {node.module} import ...")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == forbidden or alias.name.startswith(forbidden + "."):
+                        offenders.append(f"{path.name}:{node.lineno} import {alias.name}")
+            elif isinstance(node, ast.Try):
+                # try/except 包裹仍然是模块级执行，同样有闭环风险
+                scan(node.body, path)
+                scan(node.orelse, path)
+                scan(node.finalbody, path)
+                for handler in node.handlers:
+                    scan(handler.body, path)
+            elif isinstance(node, ast.If):
+                scan(node.body, path)
+                scan(node.orelse, path)
+
+    files = sorted(root.rglob("*.py"))
+    assert files, "未找到任何模块，测试自身失效"
+    for path in files:
+        scan(ast.parse(path.read_text(encoding="utf-8"), str(path)).body, path)
+
+    assert not offenders, "模块顶层 import gateway.run 会导致 Hermes 插件加载递归：\n  " + "\n  ".join(
+        offenders
+    )
+
+
+def test_lifecycle_phrases_are_lazy_and_correct() -> None:
+    """惰性借常量后，识别能力不得退化；降级判定不能靠比对短语值.
+
+    **本测试有环境副作用需要清理**：在真实安装的 Hermes venv 里，探测常量会
+    ``import gateway.run``，而它的模块体会触发 Hermes 的插件发现，从而真实执行
+    一次 ``register()`` 织入。若不回滚，后续断言「未织入」的测试会被污染——
+    这正是本文件末尾 finally 段存在的原因。
+    """
+    from hermes_lark_streaming.events import normalize as N
+
+    try:
+        # 短语表在被调用前应保持未探测状态（模块 import 不触发 gateway.run）
+        fresh = N._lifecycle_phrases is None
+
+        assert N.is_lifecycle_notice("⚠️ Gateway shutting down — Your current task will be interrupted.")
+        assert N.is_lifecycle_notice("Gateway restarting now")
+        assert not N.is_lifecycle_notice("↪ Redirected current run (iteration 1/90).")
+        assert not N.is_lifecycle_notice("")
+
+        # 探测过后必有结果，且带缓存（第二次不重新 import）
+        assert N._lifecycle_phrases is not None
+        first = N._lifecycle_phrases
+        N.is_lifecycle_notice("x")
+        assert N._lifecycle_phrases is first
+
+        # Hermes 常量值恰好与内置兜底逐字相同，所以「是否降级」只能由标志位判定，
+        # 比对短语值必然得出错误结论——这条断言锁死这个判据
+        assert N._FALLBACK_LIFECYCLE_PHRASES == ("Gateway shutting down", "Gateway restarting")
+        borrowed = N.lifecycle_constants_borrowed()
+        assert isinstance(borrowed, bool)
+        if borrowed:
+            assert N._lifecycle_phrases  # 借到了就必须有值
+        if fresh:
+            assert N._lifecycle_phrases is not None
+    finally:
+        # 回滚可能被 Hermes 加载器顺带装上的织入。teardown 幂等，未织入时无副作用
+        try:
+            from hermes_lark_streaming.bridge.plugin import teardown
+
+            teardown()
+        except Exception:
+            pass
+
+
 def test_distribution_conflict_detection() -> None:
     """同名分发冲突必须能被识别——这是启用本插件时最容易踩的坑.
 

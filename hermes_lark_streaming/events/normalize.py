@@ -44,26 +44,77 @@ except Exception:
     logger.debug("Hermes 压缩常量不可用，状态分类降级为内置模式表", exc_info=True)
 
 
-#: Gateway 生命周期通知的特征短语。这类消息必须**同时**进卡片与聊天，
-#: 见 :func:`is_lifecycle_notice` 的说明。
-#: 优先从 Hermes 借常量（与上面复用压缩模板同源），拿不到时用实测字面量兜底。
-_LIFECYCLE_PHRASES: tuple[str, ...] = ("Gateway shutting down", "Gateway restarting")
+#: Gateway 生命周期通知的特征短语（内置兜底）。这类消息必须**同时**进卡片与
+#: 聊天，见 :func:`is_lifecycle_notice` 的说明。
+_FALLBACK_LIFECYCLE_PHRASES: Final[tuple[str, ...]] = ("Gateway shutting down", "Gateway restarting")
 
-try:  # pragma: no cover - 依赖运行时 Hermes 环境
-    from gateway.run import (  # type: ignore[import-not-found]
-        _INTERRUPT_REASON_GATEWAY_RESTART,
-        _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
-    )
+#: 实际生效的短语表。``None`` 表示还没尝试过从 Hermes 借常量
+_lifecycle_phrases: tuple[str, ...] | None = None
 
-    _borrowed = tuple(
-        str(item)
-        for item in (_INTERRUPT_REASON_GATEWAY_SHUTDOWN, _INTERRUPT_REASON_GATEWAY_RESTART)
-        if isinstance(item, str) and item.strip()
-    )
-    if _borrowed:
-        _LIFECYCLE_PHRASES = _borrowed
-except Exception:
-    logger.debug("Hermes 生命周期常量不可用，使用内置短语表", exc_info=True)
+#: 是否成功从 Hermes 借到了生命周期常量。
+#: **单独记这个标志而不是比对短语值**：Hermes 的常量值恰好与内置兜底逐字相同
+#: （都是 "Gateway shutting down" / "Gateway restarting"），比对值永远得出
+#: 「没借到」的错误结论。降级与否只能由 import 是否成功来判定
+_lifecycle_borrowed = False
+
+
+def _lifecycle_phrase_table() -> tuple[str, ...]:
+    """取生命周期短语表，首次调用时才尝试从 Hermes 借常量.
+
+    **这里必须惰性导入，绝不能放在模块顶层。** ``gateway/run.py`` 的模块体里
+    就调用了 ``get_plugin_auxiliary_tasks()``，而它会触发 Hermes 的插件发现。
+    若在本模块顶层 ``import gateway.run``，就会形成闭环：
+
+    .. code-block:: text
+
+        Hermes 加载本插件 → import events/normalize → import gateway.run
+          → gateway.run 模块体触发插件发现 → 再次加载本插件
+            → 此时本插件模块仍在初始化中，register() 还没定义
+              → Hermes 报「Plugin 'hermes-lark-streaming' has no register() function」
+
+    外层加载最终会拿到完整模块并正常调用 ``register()``，但嵌套的那几层会在
+    Hermes 的插件注册表里留下「加载失败」记录，`hermes plugins list` 也会
+    据此误报。惰性导入把时机推到第一次真正判定消息时，那时 ``gateway.run``
+    早已 import 完毕，不会再触发新一轮发现。
+
+    这个缺陷只在「pip 安装 + 由 Hermes 插件加载器加载」的真实部署形态下出现，
+    直接调 ``bootstrap()`` 的测试路径构不成闭环——所以它是靠真机安装才暴露的。
+    """
+    global _lifecycle_phrases
+    if _lifecycle_phrases is not None:
+        return _lifecycle_phrases
+
+    phrases = _FALLBACK_LIFECYCLE_PHRASES
+    try:
+        from gateway.run import (  # type: ignore[import-not-found]
+            _INTERRUPT_REASON_GATEWAY_RESTART,
+            _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
+        )
+
+        borrowed = tuple(
+            str(item)
+            for item in (_INTERRUPT_REASON_GATEWAY_SHUTDOWN, _INTERRUPT_REASON_GATEWAY_RESTART)
+            if isinstance(item, str) and item.strip()
+        )
+        if borrowed:
+            phrases = borrowed
+            globals()["_lifecycle_borrowed"] = True
+    except Exception:
+        logger.debug("Hermes 生命周期常量不可用，使用内置短语表", exc_info=True)
+
+    _lifecycle_phrases = phrases
+    return phrases
+
+
+def lifecycle_constants_borrowed() -> bool:
+    """生命周期短语是否来自 Hermes 常量（而非内置兜底）.
+
+    首次调用会触发一次惰性探测，因此 ``status`` / ``doctor`` 调用它即可拿到
+    确定结论。返回 False 说明处于降级模式：Hermes 改了关闭/重启文案时，
+    本插件不会自动跟随。
+    """
+    _lifecycle_phrase_table()
+    return _lifecycle_borrowed
 
 
 def is_lifecycle_notice(text: str) -> bool:
@@ -80,7 +131,7 @@ def is_lifecycle_notice(text: str) -> bool:
     if not text:
         return False
     lowered = text.lower()
-    return any(phrase.lower() in lowered for phrase in _LIFECYCLE_PHRASES)
+    return any(phrase.lower() in lowered for phrase in _lifecycle_phrase_table())
 
 
 

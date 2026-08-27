@@ -17,6 +17,7 @@ from .normalize import (
     hermes_constants_available,
     is_lifecycle_notice,
     is_noise_status,
+    lifecycle_constants_borrowed,
     split_reasoning_text,
     strip_reasoning_tags,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "hermes_constants_available",
     "is_lifecycle_notice",
     "is_noise_status",
+    "lifecycle_constants_borrowed",
     "make_event",
     "split_reasoning_text",
     "strip_reasoning_tags",
