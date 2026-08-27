@@ -1351,6 +1351,79 @@ def test_drain_pending_finalize_schedules_one_coro_per_turn() -> None:
     assert orch.drain_pending_finalize() == 0
 
 
+def test_state_dir_name_cannot_shadow_the_package() -> None:
+    """状态目录名必须不是合法 Python 标识符.
+
+    这条断言守的是一个曾让插件在真实 gateway 里**完全无法加载**的缺陷：
+
+    状态目录原名 ``hermes_lark_streaming``，与包名相同，位于 ``~/.hermes/``。
+    而 gateway 以 ``python -m hermes_cli.main gateway run`` 启动、cwd 正是
+    ``~/.hermes``，``python -m`` 会把 cwd 放进 ``sys.path[0]``。于是这个只装着
+    两个 JSON 的目录被 Python 当成**命名空间包**，抢在 editable finder 之前
+    遮蔽了真正的包，Hermes 报：
+
+        cannot import name '__version__' from 'hermes_lark_streaming'
+        (unknown location)
+
+    连字符不能出现在 Python 标识符里，改名后彻底免疫。任何把目录名改回
+    下划线形式的改动都会让这条测试失败。
+    """
+    from hermes_lark_streaming.selfheal.store import _LEGACY_STATE_DIRNAME, _STATE_DIRNAME, state_dir
+
+    assert not _STATE_DIRNAME.isidentifier(), (
+        f"状态目录名 {_STATE_DIRNAME!r} 是合法 Python 标识符，"
+        "会在 gateway 的 cwd 下遮蔽同名包，导致插件永远加载不上"
+    )
+    # 旧名字确实是标识符——这正是当初出问题的原因，留作对照
+    assert _LEGACY_STATE_DIRNAME.isidentifier()
+    assert _STATE_DIRNAME != _LEGACY_STATE_DIRNAME
+
+    # 包名与目录名必须不同，否则换了名字也白搭
+    import hermes_lark_streaming
+
+    assert _STATE_DIRNAME != hermes_lark_streaming.__name__
+    assert state_dir(Path("/tmp/x")).name == _STATE_DIRNAME
+
+
+def test_legacy_state_dir_is_migrated() -> None:
+    """旧状态目录要能一次性迁到新名字，且不覆盖已有新数据."""
+    import json
+    import tempfile
+
+    from hermes_lark_streaming.selfheal.store import (
+        _LEGACY_STATE_DIRNAME,
+        migrate_legacy_dir,
+        state_dir,
+    )
+
+    home = Path(tempfile.mkdtemp())
+    legacy = home / _LEGACY_STATE_DIRNAME
+    legacy.mkdir()
+    (legacy / "state.json").write_text(json.dumps({"schema": 1, "marker": "old"}), encoding="utf-8")
+    (legacy / "activity.json").write_text(json.dumps({"pid": 1}), encoding="utf-8")
+
+    assert migrate_legacy_dir(home) is True
+    target = state_dir(home)
+    assert json.loads((target / "state.json").read_text(encoding="utf-8"))["marker"] == "old"
+    assert (target / "activity.json").is_file()
+    # 搬空后旧目录应被清理，不留下能遮蔽包的空目录
+    assert not legacy.exists(), "旧目录必须删除——空目录同样会被当作命名空间包"
+
+    # 幂等：再迁一次不报错也不做事
+    assert migrate_legacy_dir(home) is False
+
+    # 已有新数据时不被旧数据覆盖
+    home2 = Path(tempfile.mkdtemp())
+    legacy2 = home2 / _LEGACY_STATE_DIRNAME
+    legacy2.mkdir()
+    (legacy2 / "state.json").write_text(json.dumps({"marker": "old"}), encoding="utf-8")
+    target2 = state_dir(home2)
+    target2.mkdir(parents=True)
+    (target2 / "state.json").write_text(json.dumps({"marker": "new"}), encoding="utf-8")
+    migrate_legacy_dir(home2)
+    assert json.loads((target2 / "state.json").read_text(encoding="utf-8"))["marker"] == "new"
+
+
 def test_no_module_level_gateway_run_import() -> None:
     """本插件任何模块都不得在**模块顶层** import ``gateway.run``.
 

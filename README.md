@@ -66,7 +66,9 @@ agent.stream_delta_callback = _stream_delta_cb
 - 不与其他注入类插件抢源码，**无冲突**
 - 万一 Hermes 改了内部装配方式，**启动时立刻报错**，而不是静默失效
 
-唯一会留下的是插件自己的状态目录 `~/.hermes/hermes_lark_streaming/`，里面两个文件：`state.json`（自愈经验与织入指纹，可用 `selfheal.enabled: false` 关闭）与 `activity.json`（运行心跳，供 `activity` 命令跨进程读取当前有没有任务在跑）。两者与 Hermes 文件零交集，删掉整个目录即彻底干净。
+唯一会留下的是插件自己的状态目录 `~/.hermes/hermes-lark-streaming/`，里面两个文件：`state.json`（自愈经验与织入指纹，可用 `selfheal.enabled: false` 关闭）与 `activity.json`（运行心跳，供 `activity` 命令跨进程读取当前有没有任务在跑）。两者与 Hermes 文件零交集，删掉整个目录即彻底干净。
+
+> 目录名用连字符不是风格选择：`~/.hermes` 正是 gateway 的工作目录，而 `python -m` 会把 cwd 放进 `sys.path[0]`。若状态目录与 Python 包同名（`hermes_lark_streaming`），它会被当成命名空间包遮蔽真正的包，Hermes 报 `cannot import name '__version__' ... (unknown location)`，插件永远加载不上。连字符不是合法标识符，因此免疫。
 
 详细论证见 [docs/03-升级韧性设计.md](docs/03-升级韧性设计.md)。
 
@@ -253,7 +255,7 @@ $HERMES_PYTHON -m hermes_lark_streaming activity  # 升级前检查：当前有�
 
 ## 自愈与经验积累
 
-插件会把运行中学到的东西落盘到 `~/.hermes/hermes_lark_streaming/state.json`，**跨 gateway 重启、跨 Hermes 升级留存**。
+插件会把运行中学到的东西落盘到 `~/.hermes/hermes-lark-streaming/state.json`，**跨 gateway 重启、跨 Hermes 升级留存**。
 
 **精准降级取代一坏全坏**。某类收纳（状态提示 / 自我改进 / 澄清 / 授权）连续失败 3 次时，只把该类退回原生透传，其余能力照常工作；结论落盘后下次启动直接生效，不必再白白失败一遍。只有失败**跨越 3 类以上**才判定为系统性故障（凭据失效、网络不可达、权限缺失）并升级为全局熔断。
 

@@ -25,7 +25,15 @@ from .healer import (
     get_healer,
     reset_healers,
 )
-from .store import SCHEMA_VERSION, activity_path, read_activity, state_path, write_activity
+from .store import (
+    SCHEMA_VERSION,
+    activity_path,
+    migrate_legacy_dir,
+    read_activity,
+    state_dir,
+    state_path,
+    write_activity,
+)
 
 __all__ = [
     "CAPABILITIES",
@@ -33,8 +41,10 @@ __all__ = [
     "SelfHealer",
     "activity_path",
     "get_healer",
+    "migrate_legacy_dir",
     "read_activity",
     "reset_healers",
+    "state_dir",
     "state_path",
     "write_activity",
 ]

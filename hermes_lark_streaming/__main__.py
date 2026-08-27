@@ -11,7 +11,7 @@
 
 **注意：没有 install / uninstall 命令。** 本插件采用运行时织入，不修改 Hermes
 任何文件，``pip install`` 即生效、``pip uninstall`` 即停止一切干预，无需额外步骤。
-唯一会留下的是插件自己的状态目录 ``<hermes_home>/hermes_lark_streaming/``
+唯一会留下的是插件自己的状态目录 ``<hermes_home>/hermes-lark-streaming/``
 （自愈经验 + 运行心跳），与 Hermes 文件零交集，删除即彻底干净。
 """
 
@@ -79,7 +79,7 @@ def _usage() -> None:
     print()
     print("本插件不修改 Hermes 源码，因此没有 install / uninstall 命令：")
     print("  pip install 即生效，pip uninstall 即停止一切干预。")
-    print("  唯一留下的是自愈状态目录 <hermes_home>/hermes_lark_streaming/，删除即净。")
+    print("  唯一留下的是自愈状态目录 <hermes_home>/hermes-lark-streaming/，删除即净。")
 
 
 def cmd_version() -> int:

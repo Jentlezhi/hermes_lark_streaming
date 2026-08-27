@@ -24,7 +24,21 @@ from ..observability import logger
 #: 状态文件 schema 版本。不兼容变更时递增，旧版本整体作废重学
 SCHEMA_VERSION = 1
 
-_STATE_DIRNAME = "hermes_lark_streaming"
+#: 状态目录名。**必须不是合法 Python 标识符**（这里用连字符，与 pip 分发名一致）。
+#:
+#: 曾用 ``hermes_lark_streaming``（与包名相同），结果插件在真实 gateway 里永远
+#: 加载不上：gateway 的 cwd 是 ``~/.hermes``，而 ``python -m`` 会把 cwd 放进
+#: ``sys.path[0]``，于是这个只装着两个 JSON 的目录被当成**命名空间包**，抢在
+#: editable finder 之前遮蔽了真正的包，Hermes 报
+#: ``cannot import name '__version__' from 'hermes_lark_streaming' (unknown location)``。
+#:
+#: 连字符不能出现在 Python 标识符里，因此改名后彻底免疫这类遮蔽。
+#: 由 ``tests/test_smoke.py`` 的静态检查守住这条不变式。
+_STATE_DIRNAME = "hermes-lark-streaming"
+
+#: 旧状态目录名。仅用于一次性迁移，迁完不再引用
+_LEGACY_STATE_DIRNAME = "hermes_lark_streaming"
+
 _STATE_FILENAME = "state.json"
 #: 运行活动心跳。与经验文件同目录但语义不同：经验是「学到的」，心跳是
 #: 「此刻的」，且心跳的读者是**另一个进程**（CLI）——gateway 内存里的活跃
@@ -42,12 +56,45 @@ except ImportError:  # pragma: no cover
 
 
 def state_dir(home: Path) -> Path:
-    """状态目录：``<hermes_home>/hermes_lark_streaming/``.
+    """状态目录：``<hermes_home>/hermes-lark-streaming/``.
 
     刻意放在 Hermes 主目录下而非包安装目录：``pip install -e .`` 的包目录
     可能只读，且 Hermes 升级不会碰主目录，经验因此能跨升级留存。
+
+    目录名用连字符而非下划线的原因见 :data:`_STATE_DIRNAME`——那不是风格
+    偏好，是一个曾让插件完全无法加载的缺陷的修复。
     """
     return Path(home) / _STATE_DIRNAME
+
+
+def migrate_legacy_dir(home: Path) -> bool:
+    """把旧的 ``hermes_lark_streaming/`` 状态目录迁到新名字下.
+
+    返回是否实际做了迁移。全程静默容错：迁移失败最坏结果是经验从零重学，
+    不值得因此影响插件加载。已存在新目录时只搬缺失的文件，不覆盖新数据。
+    """
+    legacy = Path(home) / _LEGACY_STATE_DIRNAME
+    if not legacy.is_dir():
+        return False
+
+    target = state_dir(home)
+    moved = False
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for name in (_STATE_FILENAME, _ACTIVITY_FILENAME):
+            src = legacy / name
+            dst = target / name
+            if src.is_file() and not dst.exists():
+                src.replace(dst)
+                moved = True
+        # 只在确实空了才删，避免误删用户放进去的东西
+        if not any(legacy.iterdir()):
+            legacy.rmdir()
+        if moved:
+            logger.info("状态目录已迁移: %s → %s", legacy.name, target.name)
+    except Exception:
+        logger.debug("状态目录迁移失败，按空白经验继续", exc_info=True)
+    return moved
 
 
 def state_path(home: Path) -> Path:
@@ -185,6 +232,7 @@ def _normalize(raw: Any, plugin_version: str) -> dict[str, Any]:
 
 def load(home: Path, plugin_version: str) -> dict[str, Any]:
     """读取经验。文件不存在、损坏、schema 不符都返回空白经验."""
+    migrate_legacy_dir(home)
     path = state_path(home)
     try:
         if not path.exists():
