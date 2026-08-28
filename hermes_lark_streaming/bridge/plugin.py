@@ -152,9 +152,12 @@ def bootstrap(*, force: bool = False) -> BootstrapReport:
             report.conversation = install_conversation_hook(orch)
 
             # ── 3. 适配器织入（入站锚点 + 游离消息拦截）──
-            from .adapter import install_adapter_hook
+            from .adapter import adapter_report, install_adapter_hook
 
             report.adapter_hooked = install_adapter_hook(orch)
+            # 把织入实况的读取函数递给编排层，让它随心跳落盘——独立进程的
+            # status / activity 只能通过这条通道看到 gateway 内部的织入结果
+            orch.set_weave_reporter(adapter_report)
 
             # ── 4. 中断织入（精确区分 /stop 与被新消息接续）──
             from .interrupt import install_interrupt_hook

@@ -190,6 +190,8 @@ class Orchestrator:
         self._watcher_lock = threading.Lock()
         # 订阅额度查询器，由 bridge 在启动时注入（见 set_usage_provider）
         self._usage_provider: Any = None
+        # 适配器织入实况查询器，同样由 bridge 注入（见 set_weave_reporter）
+        self._weave_reporter: Any = None
 
     def _safe_selfheal_enabled(self) -> bool:
         """读自愈开关。配置损坏时按开启处理——自愈层本身是旁路的，
@@ -1309,11 +1311,34 @@ class Orchestrator:
                     }
                     for turn in self._registry.active_turns()
                 ],
+                # 织入实况：适配器方法到底织上了几个。这是跨进程唯一的通道——
+                # 一次真机故障里适配器零方法织入却处处报 ok，只能靠读源码倒推
+                "weave": self._weave_snapshot(),
             }
             return write_activity(self._home, payload)
         except Exception:
             logger.debug("活动心跳发布失败", exc_info=True)
             return False
+
+    def _weave_snapshot(self) -> dict[str, Any]:
+        """取桥接层的织入实况。未注入 reporter 时返回空字典."""
+        reporter = self._weave_reporter
+        if reporter is None:
+            return {}
+        try:
+            snapshot = reporter()
+        except Exception:
+            logger.debug("织入实况读取失败", exc_info=True)
+            return {}
+        return snapshot if isinstance(snapshot, dict) else {}
+
+    def set_weave_reporter(self, reporter: Any) -> None:
+        """注入「适配器织入实况」查询器.
+
+        与 :meth:`set_usage_provider` 同一模式：实况住在 L0 桥接层，编排层不能
+        反向 import bridge，所以由 bridge 在启动时把读取函数递进来。
+        """
+        self._weave_reporter = reporter
 
     def set_usage_provider(self, provider: Any) -> None:
         """注入订阅额度查询器.

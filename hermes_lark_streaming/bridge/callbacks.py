@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -26,7 +27,7 @@ from ..events import NoticeLevel, classify_status_text, is_noise_status, split_r
 from ..events.model import EventKind
 from ..observability import logger
 from ..orchestrator import PUSH_REJECTED, Orchestrator
-from .adapter import INBOUND
+from .adapter import INBOUND, try_late_weave
 
 #: 从 agent 实例上读取会话线索的属性名（构造参数，见 gateway/run.py:5884-5893）
 _SESSION_ATTR = "gateway_session_key"
@@ -54,9 +55,17 @@ def turn_key_for(orch: Orchestrator, agent: Any, *, create: bool = True) -> str 
     agent 上带有 Hermes 构造时注入的 ``gateway_session_key`` 与 ``chat_id``
     （见 gateway/run.py:5884-5893），两者足以在注册表中定位活跃 turn。
 
-    **懒创建**（``create=True``）：首个回调到达时若尚无 turn，用适配器层记录的
-    入站消息作为 reply 锚点新建一个。这样只有真正跑 Agent 的消息才会产生卡片，
-    纯命令或被忽略的消息不会留下空卡。
+    **懒创建**（``create=True``）：首个回调到达时若尚无 turn 就新建一个。优先
+    用适配器层记录的入站消息作为 reply 锚点，让卡片挂在用户那条消息下面。
+
+    **拿不到锚点时降级为无锚点建卡，而不是放弃建卡。** 这一条是从一次真机
+    故障里改出来的：适配器织入若因任何原因没生效（Hermes 换了入站方法名、
+    实例创建早于插件加载、判定条件失配……），``INBOUND`` 就会一直是空的。
+    原先的写法在这里直接 ``return None``，结果是**卡片功能整体静默失效**——
+    不建卡、不报错、一行日志都没有，只能靠读源码倒推。
+
+    「少一个回复关系」和「卡片全废」是两件事，不该用同一个分支处理。降级后
+    卡片直发会话，其余能力（打字机、工具面板、终态、summary）全部照常。
 
     收卡路径应传 ``create=False``：turn 已结束时不该再凭空造一张新卡。
     """
@@ -82,8 +91,20 @@ def turn_key_for(orch: Orchestrator, agent: Any, *, create: bool = True) -> str 
 
     inbound = INBOUND.take(chat_id)
     if inbound is None:
-        return None
-    message_id, _thread_id = inbound
+        # 没有锚点通常意味着适配器入站织入还没生效——最常见的原因是插件加载
+        # 早于飞书适配器创建。趁这条真实消息补织一次，成功后下一条就有锚点了
+        if try_late_weave(orch):
+            inbound = INBOUND.take(chat_id)
+
+    if inbound is not None:
+        message_id, _thread_id = inbound
+        anchor_id: str | None = message_id
+    else:
+        # 降级路径：没有入站锚点，用「会话 + 毫秒时间戳」造一个进程内唯一的 key。
+        # anchor_id 为 None 时编排层直发会话，不做 reply
+        message_id = f"noanchor-{chat_id}-{int(time.time() * 1000)}"
+        anchor_id = None
+        _warn_missing_anchor(chat_id)
 
     # 同一条消息可能已建过 turn（Hermes 重试）——已存在则直接复用
     existing = orch.registry.get_active(message_id)
@@ -94,11 +115,32 @@ def turn_key_for(orch: Orchestrator, agent: Any, *, create: bool = True) -> str 
         turn_key=message_id,
         message_id=message_id,
         chat_id=chat_id,
-        anchor_id=message_id,
+        anchor_id=anchor_id,
         session_key=session_key,
     ):
         return message_id
     return None
+
+
+#: 已就「缺少入站锚点」告警过的会话。每个会话只喊一次，避免刷日志
+_anchorless_chats: set[str] = set()
+
+
+def _warn_missing_anchor(chat_id: str) -> None:
+    """首次遇到某会话缺锚点时明确告警.
+
+    用 WARNING 而非 debug：这说明适配器入站织入没生效，是需要人处理的状态。
+    卡片仍然工作（直发会话），所以不阻断，但必须留下可查的痕迹——
+    静默降级正是上一次故障排查困难的根源。
+    """
+    if chat_id in _anchorless_chats:
+        return
+    _anchorless_chats.add(chat_id)
+    logger.warning(
+        "会话 %s 无入站锚点，卡片将直发会话而非回复原消息；"
+        "这通常意味着适配器入站织入未生效（用 `status` 查看织入实况）",
+        chat_id[:16],
+    )
 
 
 # ── 通用包装 ──────────────────────────────────────────────────────

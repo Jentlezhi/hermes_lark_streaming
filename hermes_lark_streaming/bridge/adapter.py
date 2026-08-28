@@ -47,6 +47,40 @@ _FEISHU_PLATFORMS = frozenset({"feishu", "lark"})
 #: 拦截判断函数：返回 True 表示已接管，不再调用原方法
 Interceptor = Callable[[tuple[Any, ...], dict[str, Any]], bool]
 
+#: 适配器织入实况。**这个字典存在的理由是一次真机故障**：适配器一个方法都没
+#: 织上，但 ``install_adapter_hook`` 仍返回 True（它只表示 ``__init__`` 包好了），
+#: 于是 ``selftest`` 报「适配器织入: ok」、日志一片安静，而卡片完全不出现。
+#: 排查只能靠读源码倒推。织入结果必须是可查的事实，不是可推测的假设。
+_REPORT: dict[str, Any] = {
+    "init_hooked": False,  # BasePlatformAdapter.__init__ 是否已包装
+    "scanned": 0,  # 启动时 gc 扫过的适配器实例数
+    "instances": 0,  # 实际织入成功的实例数
+    "methods": [],  # 最近一次成功织入的方法名
+    "missing": [],  # 目标方法里实例上不存在的
+    "skipped": [],  # 判定为非飞书而跳过的 platform 取值
+}
+
+
+def adapter_report() -> dict[str, Any]:
+    """返回适配器织入实况的快照，供心跳落盘与 ``status`` 展示.
+
+    返回副本：调用方（编排层、CLI）不该改到桥接层的内部状态。
+    """
+    return {
+        "init_hooked": bool(_REPORT["init_hooked"]),
+        "scanned": int(_REPORT["scanned"]),
+        "instances": int(_REPORT["instances"]),
+        "methods": list(_REPORT["methods"]),
+        "missing": list(_REPORT["missing"]),
+        "skipped": list(_REPORT["skipped"]),
+    }
+
+
+def _reset_report() -> None:
+    _REPORT.update(
+        {"init_hooked": False, "scanned": 0, "instances": 0, "methods": [], "missing": [], "skipped": []}
+    )
+
 
 class InboundIndex:
     """最近入站消息索引.
@@ -294,27 +328,66 @@ def weave_adapter(orch: Orchestrator, adapter: Any) -> list[str]:
 
     只做实例级绑定，不改类——这样 Hermes 的 ``getattr(type(adapter), ...)``
     能力检查仍然看到原始类方法，不会误判平台能力。
+
+    每一步的结果都记进 :data:`_REPORT`：判定不是飞书、目标方法不存在、织入
+    成功织了哪几个，都要能事后查到。这类信息缺失时，「卡片没出现」只能靠读
+    源码倒推，而它本该是一句 ``status`` 就能看到的事实。
     """
-    if not _is_feishu(adapter) or getattr(adapter, _WOVEN_FLAG, False):
+    if getattr(adapter, _WOVEN_FLAG, False):
+        return []
+    if not _is_feishu(adapter):
+        platform = getattr(adapter, "platform", None)
+        value = str(getattr(platform, "value", platform) or "?")
+        if value not in _REPORT["skipped"]:
+            _REPORT["skipped"].append(value)
         return []
 
     applied: list[str] = []
+    missing: list[str] = []
     try:
         for name, intercept in _interceptors(orch).items():
             original = getattr(adapter, name, None)
             if original is None or not callable(original):
+                missing.append(name)
                 continue
             try:
                 setattr(adapter, name, _compose(original, intercept))
                 applied.append(name)
             except Exception:
-                logger.debug("适配器方法织入失败: %s", name, exc_info=True)
+                logger.warning("适配器方法织入失败: %s", name, exc_info=True)
         if applied:
             setattr(adapter, _WOVEN_FLAG, True)
             # 弱引用登记，供卸载时清理实例属性。用 WeakSet 而不是强引用：
             # 适配器的生命周期由 Hermes 掌握，插件不该延长它
             _WOVEN_INSTANCES.add(adapter)
-            logger.info("飞书适配器已织入: %s", ", ".join(applied))
+            _REPORT["instances"] = int(_REPORT["instances"]) + 1
+            _REPORT["methods"] = list(applied)
+            _REPORT["missing"] = list(missing)
+            logger.info(
+                "飞书适配器已织入: %s%s",
+                ", ".join(applied),
+                f"（缺失 {', '.join(missing)}）" if missing else "",
+            )
+            # 立刻把实况落盘。适配器通常晚于插件加载才创建，而心跳只在
+            # bootstrap 时写过一次（那时实况必然是 0 个实例），空闲守护又要等
+            # 第一个 turn 才启动——不在这里主动写一次，status 就永远显示「未织入」
+            try:
+                orch.publish_activity()
+            except Exception:
+                logger.debug("织入后心跳更新失败", exc_info=True)
+        else:
+            _REPORT["missing"] = list(missing)
+            # 一个都没织上意味着卡片的入站锚点与游离消息收纳全部失效，
+            # 必须显式告警而不是静静返回空列表
+            logger.warning(
+                "飞书适配器一个方法都没织上（目标方法均不存在: %s）；"
+                "卡片会降级为直发会话，游离消息不再收纳",
+                ", ".join(missing) or "?",
+            )
+            try:
+                orch.publish_activity()
+            except Exception:
+                logger.debug("织入后心跳更新失败", exc_info=True)
     except Exception:
         logger.warning("适配器织入异常，保持原生行为", exc_info=True)
         return []
@@ -348,6 +421,7 @@ def install_adapter_hook(orch: Orchestrator) -> bool:
     try:
         BasePlatformAdapter.__init__ = patched_init  # type: ignore[method-assign]
         setattr(BasePlatformAdapter, _WOVEN_FLAG, True)
+        _REPORT["init_hooked"] = True
     except Exception:
         logger.warning("BasePlatformAdapter 织入失败", exc_info=True)
         return False
@@ -394,23 +468,97 @@ def uninstall_adapter_hook() -> bool:
     _WOVEN_INSTANCES.clear()
     INBOUND.clear()
     _original_init = None
+    _reset_report()
     return True
 
 
-def _weave_existing_adapters(orch: Orchestrator, base_class: type) -> None:
-    """补织入已经创建出来的适配器实例.
+def _looks_like_feishu_adapter(obj: Any) -> bool:
+    """duck typing 判定飞书适配器，**刻意不用 isinstance**.
 
-    插件加载时机若晚于适配器构造，仅靠 ``__init__`` 织入会漏掉它们。
-    用 gc 扫描一次实例，代价只在启动时付一次。
+    飞书平台是目录式动态加载的插件（模块名 ``hermes_plugins.feishu_platform.
+    adapter`` 由 Hermes 运行时构造，真实路径在 ``plugins/platforms/feishu/``）。
+    这类模块 import 到的 ``gateway.platforms.base`` 未必与本插件 import 到的是
+    同一个模块对象；类对象一旦不同，``isinstance`` 判定与 ``__init__`` 织入就
+    双双失效，而现象是「构造函数已包装、却一个实例都没织上」——正是真机排查
+    了三轮才定位的那个形状。
+
+    改用能力判定：有 ``platform`` 且值为 feishu/lark，且有可调用的 ``send``。
+    与类身份完全无关，因此对动态加载免疫。
     """
+    if getattr(obj, _WOVEN_FLAG, False):
+        return False
+    if not _is_feishu(obj):
+        return False
+    return callable(getattr(obj, "send", None))
+
+
+def scan_and_weave(orch: Orchestrator) -> int:
+    """gc 扫描当前进程里的飞书适配器并织入，返回织入的实例数.
+
+    用于两个时机：启动时补织（多半扫不到，适配器还没建），以及**首条消息到来
+    时的迟到补织**——那时适配器必然已存在。后者是绕开「插件早于适配器创建」
+    这个时序问题的根本手段，不依赖任何构造函数钩子。
+    """
+    woven = 0
+    scanned = 0
     try:
         import gc
 
         for obj in gc.get_objects():
             try:
-                if isinstance(obj, base_class) and _is_feishu(obj):
-                    weave_adapter(orch, obj)
+                if not _looks_like_feishu_adapter(obj):
+                    continue
+                scanned += 1
+                if weave_adapter(orch, obj):
+                    woven += 1
             except Exception:
                 continue
     except Exception:
-        logger.debug("补织入已有适配器失败", exc_info=True)
+        logger.debug("适配器扫描失败", exc_info=True)
+    if scanned:
+        _REPORT["scanned"] = int(_REPORT["scanned"]) + scanned
+    return woven
+
+
+#: 迟到补织的尝试次数上限。``gc.get_objects()` 要遍历几十万对象，不能每条
+#: 消息都扫；织上一次之后也不再需要
+_LATE_WEAVE_LIMIT = 3
+_late_weave_attempts = 0
+
+
+def try_late_weave(orch: Orchestrator) -> bool:
+    """首条消息到来时补织适配器，返回本次是否织上.
+
+    有次数上限：扫描代价不小，而「扫了几次仍找不到」说明是别的原因，
+    继续扫也没用，只会拖慢每条消息。
+    """
+    global _late_weave_attempts
+    if _REPORT["instances"]:
+        return False
+    if _late_weave_attempts >= _LATE_WEAVE_LIMIT:
+        return False
+    _late_weave_attempts += 1
+    woven = scan_and_weave(orch)
+    if woven:
+        logger.info("迟到补织成功：本次织入 %d 个飞书适配器实例", woven)
+    else:
+        logger.warning(
+            "迟到补织未找到飞书适配器实例（第 %d/%d 次尝试）；卡片继续直发会话",
+            _late_weave_attempts,
+            _LATE_WEAVE_LIMIT,
+        )
+    return bool(woven)
+
+
+def _weave_existing_adapters(orch: Orchestrator, base_class: type) -> None:
+    """启动时补织已经创建出来的适配器实例.
+
+    通常一个都扫不到（插件加载早于平台初始化），真正兜底的是
+    :func:`try_late_weave`。这里仍扫一次，覆盖「插件晚于适配器创建」的情形。
+    """
+    woven = scan_and_weave(orch)
+    logger.info(
+        "适配器织入就绪: 构造函数已包装，启动时扫到 %d 个飞书适配器（织入 %d 个）",
+        int(_REPORT["scanned"]),
+        woven,
+    )

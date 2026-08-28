@@ -476,6 +476,64 @@ def _detect_legacy_injection(install_dir: Path | None) -> list[str]:
 # ── 命令实现 ──────────────────────────────────────────────────────
 
 
+def _render_runtime_weave(home: Path) -> list[str]:
+    """渲染 gateway 进程内的适配器织入实况（数据来自心跳文件）.
+
+    **为什么需要这一段**：`verify` 检查的是「前提成立吗」，`selftest` 检查的是
+    「在本进程能织上吗」，两者都答不出「**正在跑的那个 gateway** 里究竟织上了
+    没有」。一次真机故障就卡在这里：适配器零方法织入，而 status / selftest
+    全绿，排查只能靠读源码倒推。织入结果必须是可查的事实。
+
+    实况住在 gateway 内存里，本命令是另一个进程，只能读心跳落盘的那一份。
+    """
+    import time as _time
+
+    from .selfheal import read_activity
+
+    data = read_activity(home)
+    if not isinstance(data, dict):
+        return [f"  {_WARN} 无心跳记录，无法确认运行中的 gateway 是否已织入（gateway 未运行本插件？）"]
+
+    age = max(0, int(_time.time() - int(data.get("at") or 0)))
+    weave = data.get("weave")
+    if not isinstance(weave, dict) or not weave:
+        return [
+            f"  {_WARN} 心跳里没有织入实况（{_fmt_duration(age)} 前写入，"
+            "可能是旧版本插件写的心跳；重启 gateway 后再看）"
+        ]
+
+    pid = data.get("pid", "?")
+    lines = [f"  数据来源: 心跳（pid {pid}，{_fmt_duration(age)} 前）"]
+
+    init_hooked = bool(weave.get("init_hooked"))
+    lines.append(
+        f"  {_OK if init_hooked else _FAIL} 适配器构造函数"
+        + ("已包装（新建的适配器会自动织入）" if init_hooked else "未包装")
+    )
+
+    methods = [str(item) for item in weave.get("methods") or []]
+    instances = int(weave.get("instances") or 0)
+    missing = [str(item) for item in weave.get("missing") or []]
+    scanned = int(weave.get("scanned") or 0)
+
+    if instances and methods:
+        lines.append(f"  {_OK} 已织入 {instances} 个适配器实例: {', '.join(methods)}")
+    elif scanned:
+        lines.append(f"  {_FAIL} 扫到 {scanned} 个适配器实例但一个方法都没织上")
+    else:
+        lines.append(
+            f"  {_WARN} 尚未织入任何适配器实例"
+            "（若已发过消息仍是这样，说明入站织入没生效，卡片会直发会话）"
+        )
+
+    if missing:
+        lines.append(f"  {_WARN} 目标方法在实例上不存在: {', '.join(missing)}")
+    skipped = [str(item) for item in weave.get("skipped") or []]
+    if skipped:
+        lines.append(f"  · 判定为非飞书而跳过的平台: {', '.join(skipped)}")
+    return lines
+
+
 def cmd_status() -> int:
     from .config import Config, hermes_home
 
@@ -538,6 +596,11 @@ def cmd_status() -> int:
     print("织入前提")
     ok, detail = _check_weave_preconditions()
     print(f"  {_OK if ok else _FAIL} {detail}")
+
+    print()
+    print("gateway 内的织入实况")
+    for line in _render_runtime_weave(home):
+        print(line)
 
     print()
     print("自愈经验")
