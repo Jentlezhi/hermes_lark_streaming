@@ -25,6 +25,14 @@ LARK_DOMAIN = "https://open.larksuite.com"
 # 卡片元素预算：飞书单卡硬上限 200，留 20 给 footer 与估算误差
 DEFAULT_ELEMENT_THRESHOLD = 180
 
+#: turn 空闲多久后由守护强制收卡（秒）。
+#:
+#: 这里的「空闲」已排除工具执行期间——守护判定时会先看有没有工具还在跑
+#: （见 ``_IdleWatcher._sweep``），所以这个值指的是**确实什么都没在跑**的时长，
+#: 不需要为一次几分钟的编译或测试预留余量。真正挂死的情况另有
+#: :attr:`Config.turn_ttl_sec` 兜底。
+DEFAULT_IDLE_FINALIZE_SEC = 90
+
 #: 主配置缓存有效期（秒）。取 5 秒的理由：用户改完 config.yaml 切回飞书发下
 #: 一条消息，间隔本身就超过 5 秒，再短没有可感知收益；而每 5 秒一次 stat
 #: 的开销可以忽略。刻意不用文件监听——inotify/FSEvents 要引入平台差异与
@@ -457,6 +465,20 @@ class Config:
             DEFAULT_ELEMENT_THRESHOLD,
             minimum=20,
             maximum=199,
+        )
+
+    @property
+    def idle_finalize_sec(self) -> int:
+        """turn 空闲多久后由守护强制收卡（秒）.
+
+        下限取 15 秒：比守护的扫描间隔（15 秒）更小的阈值没有意义，实际生效
+        粒度受扫描间隔限制。默认值的语义见 :data:`DEFAULT_IDLE_FINALIZE_SEC`。
+        """
+        return _as_int(
+            _as_dict(self._streaming().get("limits")).get("idle_finalize_sec"),
+            DEFAULT_IDLE_FINALIZE_SEC,
+            minimum=15,
+            maximum=86400,
         )
 
     @property

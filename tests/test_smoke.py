@@ -371,6 +371,92 @@ def test_element_budget_estimation() -> None:
     assert not exceeds(10, 5, 180)
 
 
+def test_growing_tool_panel_stays_within_card_limit() -> None:
+    """工具面板在同一段内持续增长时，单卡元素数不得越过飞书上限.
+
+    工具步骤是追加进**同一个** segment 的（``on_tool_event`` 里相邻同类只标脏），
+    所以它的元素数会一直涨，而拆卡的触发点在「新段创建」分支里——纯工具增长
+    产生不了新段。若预算不跟着对账、段不在步边界截断，面板会一路涨到 200 上限
+    之外，``batch_update`` 从此每次整批失败且不自愈（拿基线跑同一场景：61 步
+    时单卡真实元素 429，12 轮里 7 轮越限）。
+    """
+    import asyncio
+    import tempfile
+    from typing import Any
+
+    from hermes_lark_streaming.core.segments import SegmentType
+    from hermes_lark_streaming.core.turn import Turn, TurnState
+    from hermes_lark_streaming.orchestrator import Orchestrator, _TurnRuntime
+    from hermes_lark_streaming.render.budget import estimate_tool_elements
+    from hermes_lark_streaming.transport import FlushScheduler, MessageGuard
+
+    #: 飞书单卡元素硬上限。越过即整次更新失败，不是截断
+    feishu_hard_limit = 200
+
+    class _SilentClient:
+        async def batch_update(self, card_id: str, actions: list[Any], *, sequence: int) -> None:
+            return None
+
+        async def stream_element(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        async def create_card(self, card: dict[str, Any]) -> str:
+            return "card-next"
+
+        async def reply_with_card(self, anchor_id: str, card_id: str) -> str:
+            return "msg-next"
+
+    def live_elements(turn: Turn) -> int:
+        """当前这张卡上真实存活的元素数：loading + 本卡已创建的工具段."""
+        steps = turn.tools.build_display_steps()
+        total = 1
+        for seg in turn.segment_state.segments[turn.split_index :]:
+            if seg.type == SegmentType.TOOL and seg.created:
+                total += estimate_tool_elements(
+                    seg.tool_offset, seg.tool_end_offset or len(steps), steps
+                )
+        return total
+
+    async def scenario() -> tuple[int, int, int]:
+        orch = Orchestrator(Path(tempfile.mkdtemp()))
+        orch._client = _SilentClient()  # type: ignore[assignment]
+
+        turn = Turn(turn_key="t", message_id="m", chat_id="c")
+        turn.bind_card(card_id="card-1", card_msg_id="msg-1")
+        turn.transition(TurnState.STREAMING)
+        turn.element_count = 1  # loading 占位
+        scheduler = FlushScheduler(lambda: orch._flush(turn), loop=asyncio.get_running_loop())
+        scheduler.set_ready(True)
+        orch._runtimes[turn.turn_key] = _TurnRuntime(
+            scheduler=scheduler,
+            guard=MessageGuard(
+                anchor_id="m",
+                card_msg_id_getter=lambda: turn.card_msg_id,
+                on_terminate=turn.mark_fallback,
+            ),
+        )
+
+        turn.add_tool_start("bash", "make build")
+        await orch._flush(turn)
+        peak = live_elements(turn)
+        for _ in range(12):
+            for _ in range(5):
+                turn.add_tool_end("bash", output='{"ok":true,"lines":120}')
+                turn.add_tool_start("bash", "next")
+            await orch._flush(turn)
+            peak = max(peak, live_elements(turn))
+        return peak, len(turn.segment_state.segments), turn.element_count
+
+    peak, segment_count, element_count = asyncio.run(scenario())
+
+    # 单卡从不越过飞书硬上限
+    assert peak <= feishu_hard_limit, peak
+    # 超预算的面板确实被切开了（基线只有 1 段）
+    assert segment_count > 1, segment_count
+    # 预算跟着真实占用走，不再停在创建那一刻
+    assert element_count > 1, element_count
+
+
 def test_cron_and_background_cards() -> None:
     from hermes_lark_streaming.render import build_background_card, build_cron_card
 
@@ -1180,7 +1266,7 @@ def test_pending_finalize_queue_is_bounded() -> None:
 def test_timeout_finalize_is_not_rendered_as_success() -> None:
     """超时收尾必须与「已完成」区分开.
 
-    空闲守护过去走 complete_turn，卡片显示 ✅ 已完成——而真相是 90 秒没动静。
+    空闲守护过去走 complete_turn，卡片显示 ✅ 已完成——而真相是一直没动静。
     用户看到 ✅ 会以为任务成功，这比不收卡更误导。
     """
     import tempfile
@@ -1274,6 +1360,152 @@ def test_timeout_notice_explains_task_may_still_run() -> None:
         assert "⏱️" in text
         assert "失败" not in text
     assert "不受影响" in orch._timeout_notice(REASON_EVICTED)
+
+
+def _sweep_once(orch: object, *, running_tool: bool, idle_for: float) -> list[tuple[str, str]]:
+    """跑一轮空闲守护扫描，返回它决定收卡的 turn 列表.
+
+    替掉 ``abort_turn`` 而不是给它准备一个假 client：这里要验的是**守护的判定**，
+    收卡本身另有测试覆盖。
+    """
+    import asyncio
+    import time
+    from typing import Any
+
+    from hermes_lark_streaming.core.turn import TurnState
+    from hermes_lark_streaming.orchestrator import _IdleWatcher
+
+    async def scenario() -> list[tuple[str, str]]:
+        turn = orch.registry.create(turn_key="t", message_id="m", chat_id="c")  # type: ignore[attr-defined]
+        assert turn is not None
+        turn.bind_card(card_id="c1", card_msg_id="m1")
+        turn.transition(TurnState.STREAMING)
+        turn.add_tool_start("bash", "make build")
+        if not running_tool:
+            turn.add_tool_end("bash", output="done")
+        turn.updated_at = time.time() - idle_for
+
+        called: list[tuple[str, str]] = []
+
+        async def fake_abort(turn_key: str, **kwargs: Any) -> None:
+            called.append((turn_key, str(kwargs.get("reason") or "")))
+
+        orch.abort_turn = fake_abort  # type: ignore[attr-defined]
+        await _IdleWatcher(orch)._sweep()  # type: ignore[arg-type]
+        return called
+
+    return asyncio.run(scenario())
+
+
+def test_idle_watcher_skips_turn_with_running_tool() -> None:
+    """工具还在执行时不得判超时——那是在干活，不是卡死.
+
+    工具执行期间 Hermes 不产生任何回调，``updated_at`` 一动不动，跟真卡死在时间
+    维度上完全同形。不看一眼工具状态，一次几分钟的编译或测试就会被判成超时，
+    卡片提前定格成「⏱️ 已超时收尾」而任务其实还在跑。
+    """
+    import tempfile
+
+    from hermes_lark_streaming.orchestrator import Orchestrator
+
+    # 工具仍在跑：远超阈值也不收卡
+    assert _sweep_once(Orchestrator(Path(tempfile.mkdtemp())), running_tool=True, idle_for=100) == []
+
+    # 工具已结束：超过阈值照常收卡，且原因是超时而非完成
+    finalized = _sweep_once(Orchestrator(Path(tempfile.mkdtemp())), running_tool=False, idle_for=100)
+    assert [key for key, _ in finalized] == ["t"]
+    assert finalized[0][1] == "timeout"
+
+    # 没到阈值就不该动
+    assert _sweep_once(Orchestrator(Path(tempfile.mkdtemp())), running_tool=False, idle_for=50) == []
+
+
+def test_idle_finalize_sec_is_configurable() -> None:
+    """空闲阈值可配，且卡内说明文案必须跟着走.
+
+    文案里写死一个数字，用户改了配置就会看到与实际不符的说明——那比不写数字
+    更糟，因为它看起来是确切的。
+    """
+    import tempfile
+    import textwrap
+
+    from hermes_lark_streaming.config import DEFAULT_IDLE_FINALIZE_SEC, Config
+    from hermes_lark_streaming.core.turn import REASON_TIMEOUT
+    from hermes_lark_streaming.orchestrator import Orchestrator
+
+    def home_with(value: object) -> Path:
+        home = Path(tempfile.mkdtemp())
+        (home / "config.yaml").write_text(
+            textwrap.dedent(f"""
+                streaming:
+                  enabled: true
+                  limits:
+                    idle_finalize_sec: {value}
+            """),
+            encoding="utf-8",
+        )
+        return home
+
+    # 未配置时用默认值
+    assert Config(Path(tempfile.mkdtemp())).idle_finalize_sec == DEFAULT_IDLE_FINALIZE_SEC
+
+    # 配置生效，且守护按新阈值判定
+    orch = Orchestrator(home_with(30))
+    assert orch.config.idle_finalize_sec == 30
+    assert [key for key, _ in _sweep_once(orch, running_tool=False, idle_for=50)] == ["t"]
+    # 说明文案跟着配置走，不是写死的 90
+    assert "30 秒" in orch._timeout_notice(REASON_TIMEOUT)
+
+    # 低于下限夹取；坏值回退默认。配置损坏绝不能让守护失灵
+    assert Config(home_with(5)).idle_finalize_sec == 15
+    assert Config(home_with("坏值")).idle_finalize_sec == DEFAULT_IDLE_FINALIZE_SEC
+
+
+def test_finalized_card_summary_shows_terminal_state() -> None:
+    """终态卡片的会话列表摘要必须是终态文案，不能停在「正在写」.
+
+    收卡时 ``turn.state`` 还停在 FINALIZING（真终态要等 update_card 成功才敢
+    落定），渲染 summary 时若不带上目标终态，已完成的任务在会话列表里就显示成
+    「✍️ 正在写」——正是 summary 这个机制本身要治理的问题。
+    """
+    import asyncio
+    import tempfile
+    from typing import Any
+
+    from hermes_lark_streaming.core.turn import Delivery, Turn, TurnState
+    from hermes_lark_streaming.orchestrator import Orchestrator
+
+    class _RecordingClient:
+        """只记录整卡替换内容的替身，不碰网络."""
+
+        def __init__(self) -> None:
+            self.cards: list[dict[str, Any]] = []
+
+        async def close_streaming(self, card_id: str, *, sequence: int) -> None:
+            return None
+
+        async def update_card(self, card_id: str, card: dict[str, Any], *, sequence: int) -> None:
+            self.cards.append(card)
+
+    orch = Orchestrator(Path(tempfile.mkdtemp()))
+    client = _RecordingClient()
+    orch._client = client  # type: ignore[assignment]
+
+    turn = Turn(turn_key="t", message_id="m", chat_id="c")
+    turn.bind_card(card_id="card-1", card_msg_id="msg-1")
+    turn.transition(TurnState.STREAMING)
+    turn.add_answer("最终回答")
+    # 与 complete_turn 的成功路径一致：先进 FINALIZING，收卡成功后才落定终态
+    turn.transition(TurnState.FINALIZING)
+
+    assert asyncio.run(orch._finalize(turn, is_error=False, is_aborted=False)) is Delivery.TAKEN
+    assert turn.state is TurnState.COMPLETED
+
+    card = client.cards[-1]
+    summary = card["config"]["summary"]["content"]
+    assert summary.startswith("✅"), summary
+    assert "✍️" not in summary
+    assert card["header"]["template"] == "green"
 
 
 def test_finalize_detached_skips_terminal_turn() -> None:

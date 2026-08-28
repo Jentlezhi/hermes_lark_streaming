@@ -203,6 +203,22 @@ class ToolTracker:
             return 0.0
         return (time.time() - self._session.started_at) * 1000
 
+    @property
+    def has_running(self) -> bool:
+        """是否还有工具正在执行.
+
+        空闲守护用它区分「任务卡死」与「任务在跑但暂时没输出」：工具执行期间
+        Hermes 不产生任何回调，turn 的 ``updated_at`` 一动不动，两种情况在时间
+        维度上长得一模一样。不做这个区分，一次跑几分钟的编译或测试就会被判成
+        超时，卡片提前定格成「已超时收尾」而任务其实还在跑。
+
+        刻意不复用 :meth:`current_action`：那个方法要做脱敏与字符串拼接，而这里
+        只需要一个布尔值——守护每轮扫描都要对每个活跃 turn 问一次。
+        """
+        if self._session is None:
+            return False
+        return any(step.status == ToolStatus.RUNNING for step in self._session.steps)
+
     def record_start(self, name: str, detail: str = "") -> None:
         if self._session is None:
             self._session = ToolSession(started_at=time.time())

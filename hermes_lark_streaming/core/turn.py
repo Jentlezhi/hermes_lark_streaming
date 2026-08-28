@@ -201,6 +201,17 @@ class Turn:
     def has_card(self) -> bool:
         return bool(self.card_id)
 
+    @property
+    def has_running_tool(self) -> bool:
+        """是否还有工具正在执行（供空闲守护判定用）.
+
+        持锁访问 :class:`ToolTracker`：那个类本身不加锁，约定由 Turn 持锁后调用
+        （见其类文档）。守护跑在事件循环上，而工具事件来自 worker 线程，这里是
+        真正的跨线程读取，不能绕过约定。
+        """
+        with self.lock:
+            return self.tools.has_running
+
     def bind_card(self, *, card_id: str, card_msg_id: str) -> None:
         with self.lock:
             self.card_id = card_id
@@ -343,18 +354,23 @@ class Turn:
 
     # ── 会话列表状态摘要（治理「切走后看不出是否完成」）──────────────
 
-    def summary_text(self, cfg: Config) -> str:
+    def summary_text(self, cfg: Config, *, state_override: TurnState | None = None) -> str:
         """生成会话列表预览文案.
 
         飞书把 ``card.config.summary`` 显示在会话列表，这是唯一的跨会话
         状态通道。文案随阶段实时更新，用户不点开也能判断任务是否跑完。
+
+        ``state_override`` 专供终态收卡：那一刻 ``self.state`` 还停在
+        ``FINALIZING``（真正的终态要等 ``update_card`` 成功才敢落定），而卡片上
+        要写的是本次收卡的**目标**终态。不传它就会把已完成的任务在会话列表里
+        显示成「✍️ 正在写」——恰好是本方法存在的理由被自己破坏掉。
         """
         if not cfg.summary_enabled:
             return ""
         limit = cfg.summary_max_chars
 
         with self.lock:
-            state = self.state
+            state = state_override if state_override is not None else self.state
             pending = self.segment_state.pending_interaction()
             action = self.tools.current_action()
             last_text = self.segment_state.last_text()

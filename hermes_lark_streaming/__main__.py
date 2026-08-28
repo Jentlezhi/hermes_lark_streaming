@@ -752,7 +752,7 @@ def cmd_verify() -> int:
                     has_interrupt,
                     f"AIAgent.{_INTERRUPT_METHOD}"
                     if has_interrupt
-                    else f"未找到 {_INTERRUPT_METHOD}（可降级：中断需等空闲守护，最长 90 秒）",
+                    else f"未找到 {_INTERRUPT_METHOD}（可降级：中断需等空闲守护兜底）",
                 )
             )
         except Exception as error:

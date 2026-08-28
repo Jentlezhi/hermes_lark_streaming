@@ -56,8 +56,6 @@ CARD_CREATE_TIMEOUT_SEC = 10.0
 FINALIZE_ATTEMPTS = 3
 #: 空闲守护的扫描间隔
 WATCH_INTERVAL_SEC = 15.0
-#: turn 超过该时长无任何更新即强制收卡，保证卡片不会永久停在「处理中」
-IDLE_FINALIZE_SEC = 90.0
 #: 同时降级的能力数达此值即判定为系统性故障，升级为全局熔断。
 #: 单类失效是回调签名/语义问题，多类同时失效只可能是凭据、网络或权限。
 SYSTEMIC_DEGRADE_COUNT = 3
@@ -109,9 +107,9 @@ class _IdleWatcher:
             logger.debug("空闲守护启动失败", exc_info=True)
             return False
         logger.info(
-            "空闲守护已启动（扫描间隔 %.0fs，空闲阈值 %.0fs）",
+            "空闲守护已启动（扫描间隔 %.0fs，空闲阈值 %ds）",
             WATCH_INTERVAL_SEC,
-            IDLE_FINALIZE_SEC,
+            self._orch.config.idle_finalize_sec,
         )
         return True
 
@@ -142,22 +140,29 @@ class _IdleWatcher:
         # 进程无从得知，只能靠落盘传递（见 Orchestrator.publish_activity）
         self._orch.publish_activity()
 
+        idle_limit = self._orch.config.idle_finalize_sec
         for turn in self._orch.registry.active_turns():
             # 尚未建卡的不管；等待用户确认的也不管——审批本来就可能等很久
             if turn.state in (TurnState.IDLE, TurnState.CREATING, TurnState.WAITING):
                 continue
-            if now - turn.updated_at < IDLE_FINALIZE_SEC:
+            if now - turn.updated_at < idle_limit:
+                continue
+            # 有工具还在执行：这不是卡死，是在干活。工具执行期间 Hermes 不产生
+            # 任何回调，updated_at 一动不动，跟真卡死在时间上完全同形——不看这
+            # 一眼，一次跑几分钟的编译或测试就会被判成超时。工具事件真丢了的
+            # 极端情况由注册表的 turn_ttl_sec 兜底（prune 就在本方法开头）
+            if turn.has_running_tool:
                 continue
 
             logger.warning(
-                "turn 空闲超过 %.0fs，强制收卡: turn=%s state=%s",
-                IDLE_FINALIZE_SEC,
+                "turn 空闲超过 %ds 且无工具在执行，强制收卡: turn=%s state=%s",
+                idle_limit,
                 turn.turn_key[:12],
                 turn.state.value,
             )
             METRICS.incr("turn.idle_finalized")
             try:
-                # 走中断语义而非 complete：真相是「90 秒没动静」，不是「完成了」。
+                # 走中断语义而非 complete：真相是「一直没动静」，不是「完成了」。
                 # 渲染成 ✅ 已完成会让用户以为任务成功，比不收卡更误导
                 await self._orch.abort_turn(turn.turn_key, reason=REASON_TIMEOUT)
             except Exception:
@@ -679,6 +684,17 @@ class Orchestrator:
 
             # 已创建但内容变了
             if seg.type == SegmentType.TOOL and seg.dirty:
+                # 工具面板在同一段内持续追加步骤，真实元素数早已不是创建时估的
+                # 那个值。这里先按当前步数重算一次，超预算就在步边界截断——不做
+                # 这个判断，面板会一路涨到飞书 200 上限之外，而拆卡只在新段创建
+                # 时触发，纯工具增长产生不了新段，于是每次 flush 都失败且不自愈
+                base = max(0, turn.element_count - seg.element_estimate) + pending_total
+                if render.exceeds(
+                    base, render.estimate_segment(seg, all_steps), self._cfg.element_threshold
+                ) and self._truncate_tool_segment(turn, index, base, all_steps):
+                    # 截断插入了新段，而本轮循环的上界在进入时已固定，
+                    # 新段留给下一轮；这里主动排一次补刷，不等下个 delta
+                    runtime.scheduler.schedule()
                 start = seg.tool_offset
                 end = render.tool_segment_end(seg, all_steps)
                 actions.append(
@@ -729,6 +745,7 @@ class Orchestrator:
         except Exception as error:
             return self._handle_flush_error(turn, error, segments)
 
+        tool_steps: list[Any] | None = None
         for seg in segments:
             if seg.el_id in pending_new:
                 seg.created = True
@@ -738,6 +755,15 @@ class Orchestrator:
                 seg.dirty = bool(seg.is_text_kind and seg.text)
             elif seg.el_id in touched:
                 seg.dirty = False
+                if seg.type == SegmentType.TOOL:
+                    # 工具段是唯一会在「已创建」之后继续长大的段：本次提交的
+                    # 步数才是它的真实占用。不在这里对账，element_count 会永远
+                    # 停在创建那一刻，预算判断全部失效
+                    if tool_steps is None:
+                        tool_steps = turn.tools.build_display_steps()
+                    actual = render.estimate_segment(seg, tool_steps)
+                    turn.element_count = max(0, turn.element_count + actual - seg.element_estimate)
+                    seg.element_estimate = actual
             if seg.el_id in finalized:
                 seg.reasoning_finalized = True
         return True
@@ -813,6 +839,51 @@ class Orchestrator:
         return False
 
     # ── 拆卡 ──────────────────────────────────────────────────────
+
+    def _truncate_tool_segment(
+        self,
+        turn: Turn,
+        index: int,
+        base_count: int,
+        all_steps: list[Any],
+    ) -> bool:
+        """把增长到超预算的工具段在步边界截断，溢出的步交给一个新段.
+
+        **为什么必须有这一步**：工具面板是在**同一个段内**持续追加步骤的
+        （见 ``SegmentState.on_tool_event``：相邻同类只标脏不新建段），它的元素
+        数一直涨，而拆卡的触发点在 ``_flush`` 的「新段创建」分支里。纯工具增长
+        产生不了新段，所以那条路永远走不到——面板越过飞书 200 上限后
+        ``batch_update`` 会整次失败，且再也不会自愈。
+
+        截断后：原段被钉死在 ``offset``（``tool_end_offset`` 从 0 变成具体值），
+        元素数就此固定；新段承接后续步骤且 ``created=False``，下一轮 flush 会走
+        「新段创建」分支，那里的预算判断自然把它拆到新卡。这样就把一个走不通的
+        场景接回了已经验证过的拆卡路径。
+
+        返回是否成功截断。一步都装不下时返回 False：此时本卡其余部分已占满，
+        只能让本次更新照原样发出（失败后 :meth:`_handle_flush_error` 会重开拆卡
+        开关，由下一个新段把内容带去新卡）。
+        """
+        seg = turn.segment_state.segments[index]
+        offset = render.find_tool_split_offset(
+            base_count=base_count,
+            seg=seg,
+            all_steps=all_steps,
+            threshold=self._cfg.element_threshold,
+        )
+        if offset is None:
+            logger.warning(
+                "工具段超预算但一步都装不下，本卡已满: turn=%s el=%s",
+                turn.turn_key[:12],
+                seg.el_id,
+            )
+            METRICS.incr("card.tool_truncate_failed")
+            return False
+
+        turn.segment_state.split_tool_segment(index, offset)
+        METRICS.incr("card.tool_segment_truncated")
+        log_turn(20, turn.turn_key, "工具段超预算，在第 %d 步截断并另起新段", offset)
+        return True
 
     async def _split_card(
         self,
@@ -966,7 +1037,7 @@ class Orchestrator:
             return f"⏱️ 本轮超过 {int(self._cfg.turn_ttl_sec)} 秒无更新，卡片停止跟踪（任务可能仍在运行）"
         if reason == REASON_EVICTED:
             return f"⏱️ 同时进行的会话超过 {int(self._cfg.max_turns)} 个，本轮卡片停止跟踪（任务不受影响）"
-        return f"⏱️ 超过 {int(IDLE_FINALIZE_SEC)} 秒无更新，卡片自动收尾（任务可能仍在运行）"
+        return f"⏱️ 超过 {int(self._cfg.idle_finalize_sec)} 秒无更新，卡片自动收尾（任务可能仍在运行）"
 
     def _ensure_duration_footer(self, turn: Turn) -> None:
         """中断 / 超时收卡时补上耗时.
@@ -1078,6 +1149,14 @@ class Orchestrator:
         turn.finalize_segments()
         await self._resolve_images(turn)
 
+        # 目标终态必须先算出来：卡片里的会话列表摘要要写「本次收成什么样」，
+        # 而此刻 turn.state 还停在 FINALIZING（真正落定要等 update_card 成功，
+        # 见循环内的赋值）。不提前算，已完成的任务会在会话列表里显示成
+        # 「✍️ 正在写」，正好破坏 summary 存在的目的
+        final_state = (
+            TurnState.FAILED if is_error else TurnState.ABORTED if is_aborted else TurnState.COMPLETED
+        )
+
         client = self._ensure_client(turn.chat_id)
         card = render.build_complete_card(
             segments=turn.active_segments(),
@@ -1092,7 +1171,7 @@ class Orchestrator:
             show_tool_use=self._cfg.show_tool_use,
             header_enabled=self._cfg.header_enabled,
             width_mode=self._cfg.width_mode,
-            summary=turn.summary_text(self._cfg),
+            summary=turn.summary_text(self._cfg, state_override=final_state),
             is_error=is_error,
             is_aborted=is_aborted,
             abort_reason=turn.abort_reason,
@@ -1107,9 +1186,6 @@ class Orchestrator:
                     streaming_closed = True
                 await client.update_card(turn.card_id or "", card, sequence=turn.next_sequence())
 
-                final_state = (
-                    TurnState.FAILED if is_error else TurnState.ABORTED if is_aborted else TurnState.COMPLETED
-                )
                 turn.state = final_state
                 METRICS.incr("card.finalized")
                 log_turn(20, turn.turn_key, "卡片已收束 state=%s", final_state.value)
