@@ -181,6 +181,9 @@ streaming:
     degrade_after_failures: 3 # 单类连续失败达此值即**只降级该类**
     probe_interval: 20        # 降级后每被拦截多少次试探一次恢复
 
+  images:                    # 回答里的图片上传
+    allow_private_hosts: false # 是否允许抓取内网 / 环回地址的图片（默认禁止）
+
   usage:                     # 订阅额度（默认关闭：要打服务商外部 API）
     enabled: false
     ttl_sec: 300             # 查询结果缓存时长，额度是慢变量

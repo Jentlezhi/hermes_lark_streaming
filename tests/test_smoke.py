@@ -356,6 +356,43 @@ def test_image_ref_roundtrip() -> None:
     assert replace_image_refs(text, {}) == text
 
 
+def test_notice_text_cannot_break_out_of_font_tag() -> None:
+    """提示文本要挡住标签起始符，但不能顺手把 markdown 也转义掉.
+
+    提示的来源包括子任务摘要（模型生成）和 Hermes 状态消息，都是不可信输入。
+    不转义 ``<`` 有两个后果：``</font>`` 提前闭合让后面的文字失去配色；更常见的
+    是模型写出 ``a < b``，飞书把后面的内容当未知标签吞掉——那是丢内容。
+
+    但这里不能用 ``escape_inline``：它连 ``**粗体**`` 一起转义，提示里的 markdown
+    是希望正常渲染的。
+    """
+    from hermes_lark_streaming.core.segments import NoticeItem
+    from hermes_lark_streaming.events import NoticeLevel
+    from hermes_lark_streaming.render.elements import notice_block
+    from hermes_lark_streaming.render.markdown import escape_inline, escape_tags
+
+    content = notice_block(
+        [NoticeItem(text="子任务完成</font><font color='red'>注入的红字")],
+        is_review=False,
+    )["content"]
+    # 注入的标签被转义。剥掉所有已转义的起始符后，未转义的 font 只剩我们自己
+    # 插入的那一个——直接 count("<font") 会把 "\<font" 里的子串也数进去
+    assert "\\</font>" in content
+    assert "\\<font" in content
+    assert content.replace("\\<", "").count("<font") == 1
+
+    # 丢内容的常见形态
+    assert "a \\< b" in notice_block([NoticeItem(text="a < b")], is_review=False)["content"]
+
+    # markdown 保留 —— 这是不用 escape_inline 的理由，顺手把两者的差别钉住
+    assert escape_tags("**耗时** `bash`") == "**耗时** `bash`"
+    assert escape_inline("**耗时**") == "\\*\\*耗时\\*\\*"
+
+    # 我们自己写的提示文案不含标签起始符，不受影响
+    plain = "⏱️ 超过 90 秒无更新，卡片自动收尾（任务可能仍在运行）"
+    assert plain in notice_block([NoticeItem(text=plain, level=NoticeLevel.WARNING)], is_review=False)["content"]
+
+
 def test_element_budget_estimation() -> None:
     """预算必须宁可高估：低估会导致整次更新失败而非截断."""
     from hermes_lark_streaming.core.segments import SegmentState
@@ -1501,6 +1538,67 @@ def test_request_timeout_is_configurable() -> None:
     assert Config(home_with(1)).request_timeout_sec == 3
     assert Config(home_with(9999)).request_timeout_sec == 300
     assert Config(home_with("坏值")).request_timeout_sec == DEFAULT_REQUEST_TIMEOUT_SEC
+
+
+def test_image_download_blocks_internal_networks() -> None:
+    """待上传的图片地址来自模型输出，必须挡住内网与环回.
+
+    图片 URL 是从模型回答的 markdown 里抓出来的，属于不可信输入：一次 prompt
+    injection（模型读了恶意网页或文件）就能让 gateway 去请求任意地址，而它跑在
+    用户自己的机器上、看得到内网和云元数据服务。
+
+    本测试刻意只用 IP 字面量和 localhost，不用域名——``getaddrinfo`` 对 IP 不查
+    DNS，测试因此完全离线可跑。
+    """
+    from hermes_lark_streaming.transport.client import (
+        ClientConfig,
+        _blocked_ip,
+        _blocked_url,
+        _GuardedRedirectHandler,
+    )
+
+    # 环回、私有、链路本地（含云元数据 169.254.169.254）、未指定、多播、
+    # RFC 6598 运营商级 NAT，以及 IPv6 对应形态
+    for text in (
+        "127.0.0.1",
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.1.1",
+        "169.254.169.254",
+        "0.0.0.0",
+        "224.0.0.1",
+        "100.64.0.1",
+        "::1",
+        "fe80::1",
+        "fc00::1",
+        "根本不是 IP",
+    ):
+        assert _blocked_ip(text), text
+
+    # 公网地址必须放行，否则等于关掉图片功能
+    for text in ("8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"):
+        assert not _blocked_ip(text), text
+
+    for url in (
+        "http://127.0.0.1:8080/a.png",
+        "http://localhost/a.png",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/a.png",
+        "http://192.168.1.1/logo.png",
+        "https:///a.png",  # 无主机
+    ):
+        assert _blocked_url(url), url
+
+    assert not _blocked_url("http://8.8.8.8/a.png")
+
+    # 重定向的每一跳都要重新校验：公网 URL 不能 302 把我们带进内网。
+    # 返回 None 表示不跟随，urllib 随后抛 HTTPError 走「这张图不上传」的降级
+    handler = _GuardedRedirectHandler()
+    assert handler.redirect_request(None, None, 302, "Found", None, "http://127.0.0.1:9/x.png") is None
+    assert _GuardedRedirectHandler.max_redirections <= 5
+
+    # 默认必须是关闭的：安全默认不能靠用户去配
+    assert ClientConfig(app_id="x", app_secret="y").allow_private_image_hosts is False
 
 
 def test_finalized_card_summary_shows_terminal_state() -> None:

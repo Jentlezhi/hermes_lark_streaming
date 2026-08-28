@@ -302,6 +302,7 @@ class Orchestrator:
                         app_secret=bot["app_secret"],
                         base_url=bot["base_url"],
                         timeout_sec=float(self._cfg.request_timeout_sec),
+                        allow_private_image_hosts=self._cfg.image_allow_private_hosts,
                     )
                 )
                 self._clients[bot_id] = client
@@ -322,6 +323,7 @@ class Orchestrator:
                     app_secret=app_secret,
                     base_url=self._cfg.base_url,
                     timeout_sec=float(self._cfg.request_timeout_sec),
+                    allow_private_image_hosts=self._cfg.image_allow_private_hosts,
                 )
             )
             return self._client

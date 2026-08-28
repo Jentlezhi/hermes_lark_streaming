@@ -214,6 +214,20 @@ def escape_inline(value: str) -> str:
     return re.sub(r"([`*_{}\[\]<>])", r"\\\1", value.replace("\\", "\\\\"))
 
 
+def escape_tags(value: str) -> str:
+    """只转义标签起始符，保留其余 markdown 能力.
+
+    用在「文本要塞进 ``<font>`` 里、但本身可能带 markdown」的位置。
+    :func:`escape_inline` 在这类位置射程太大：它会把 ``**粗体**`` 也转义成字面
+    反斜杠，而提示与子任务摘要里的 markdown 是希望正常渲染的。
+
+    只处理 ``<`` 就够挡住全部标签：``>`` 单独出现不会开启标签。不转义的后果不止
+    是配色被 ``</font>`` 提前闭合——模型输出里一个 ``if a < b`` 就足以让飞书把
+    后面的内容当成未知标签吞掉，那是**丢内容**。
+    """
+    return value.replace("<", "\\<")
+
+
 def code_block(content: str, language: str = "text") -> str:
     """构造代码块，围栏长度自适应内容中的反引号."""
     normalized = normalize_markdown(content)

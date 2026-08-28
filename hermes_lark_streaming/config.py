@@ -605,6 +605,21 @@ class Config:
             return frozenset()
         return frozenset(item.strip() for item in raw if isinstance(item, str) and item.strip())
 
+    # ── 图片 ──────────────────────────────────────────────────────
+
+    @property
+    def image_allow_private_hosts(self) -> bool:
+        """是否允许抓取内网 / 环回地址上的图片.
+
+        **默认关闭。** 待上传的图片 URL 来自模型输出的 markdown，属于不可信
+        输入——一次 prompt injection（模型读了恶意网页或文件）就能让 gateway 去
+        请求任意地址，而它跑在用户自己的机器上、看得到内网。
+
+        被拦下的图片保留原始 markdown 链接，与网络失败同一条降级路径，不影响
+        回答的其余内容。确实要用内网图床的场景才需要打开这一项。
+        """
+        return _as_bool(_as_dict(self._streaming().get("images")).get("allow_private_hosts"), False)
+
     # ── 订阅额度 ──────────────────────────────────────────────────
 
 

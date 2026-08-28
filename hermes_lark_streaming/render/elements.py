@@ -15,7 +15,7 @@ from ..core.tooltrack import ToolDisplayStep
 from ..core.turn import REASON_INTERRUPTED, TIMEOUT_REASONS
 from ..events import NoticeLevel
 from . import i18n
-from .markdown import code_block, escape_inline
+from .markdown import code_block, escape_inline, escape_tags
 
 # ── 固定元素 id ───────────────────────────────────────────────────
 # loading 元素是 add_elements 的插入锚点：新元素永远插在它之前，
@@ -343,7 +343,10 @@ def notice_block(
     for item in items:
         token, color = _NOTICE_STYLE.get(item.level, _NOTICE_STYLE[NoticeLevel.INFO])
         marker = {"info_outlined": "·", "warning_outlined": "⚠", "error_outlined": "✕"}.get(token, "·")
-        text = item.text.replace("\n", " ").strip()
+        # 提示文本可能来自模型（子任务摘要）或 Hermes 状态消息，都是不可信输入。
+        # 不转义标签起始符，一个 </font> 会提前闭合配色，而 `a < b` 这种更常见的
+        # 写法会让飞书把后面的内容当未知标签吞掉——那是丢内容，不只是变丑
+        text = escape_tags(item.text.replace("\n", " ").strip())
         lines.append(f"<font color='{color}'>{marker} {text}</font>")
 
     if overflow > 0:

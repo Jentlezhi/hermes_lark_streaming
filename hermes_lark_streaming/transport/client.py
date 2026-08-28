@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import io
+import ipaddress
 import json
+import socket
 import uuid
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 # SDK 缺失时不能让整个包 import 失败：诊断命令（status / verify / doctor）的
 # 全部价值就在于环境不全时还能跑完并说清缺什么。因此这里容错导入，
@@ -60,6 +63,83 @@ _OPEN_APIS_SUFFIX = "/open-apis"
 #: 远程图片下载上限，防止超大图拖垮进程
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _IMAGE_TIMEOUT_SEC = 15
+#: 图片下载允许的重定向跳数。CDN 普遍用 302，完全禁止会拒掉大量合法图片；
+#: 但每一跳都要重新校验目标，否则一个公网 URL 可以 302 把我们带进内网
+_MAX_IMAGE_REDIRECTS = 5
+#: RFC 6598 运营商级 NAT。``ipaddress`` 不把它算作 private（实测确认），
+#: 但它同样不是可路由的公网地址，图床不会出现在这个段里
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _blocked_ip(text: str) -> bool:
+    """该地址是否落在不该访问的网段.
+
+    单看 ``is_private`` 不够——实测（Python 3.12）它不覆盖多播与 RFC 6598
+    的 100.64.0.0/10，所以这里把几类逐个列出，不依赖某一个属性的具体口径。
+    解析不出来一律视为受限：拿不到地址就无法证明它指向公网。
+    """
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return True
+    if ip.version == 4 and ip in _CGNAT_NETWORK:
+        return True
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _blocked_url(url: str) -> bool:
+    """URL 的主机是否指向受限网段（含 DNS 解析后的全部地址）.
+
+    **残留风险（如实记录）**：这里解析一次做判定，``urlopen`` 之后还会自己解析
+    一次，两次之间 DNS 记录可以变（rebinding）。彻底封堵要自己按 IP 建连并改写
+    Host 头，代价远超收益——图片上传失败只是少一张图，不是数据外泄。
+
+    任一解析结果落在受限网段就整体拒绝，不做「挑一个公网的用」——那等于把
+    判定权交给攻击者控制的 DNS。
+    """
+    host = urlsplit(url).hostname
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError, ValueError):
+        return True
+    if not infos:
+        return True
+    return any(not info[4] or _blocked_ip(str(info[4][0])) for info in infos)
+
+
+class _GuardedRedirectHandler(HTTPRedirectHandler):
+    """跟随重定向前重新校验目标主机.
+
+    返回 ``None`` 表示不处理这次重定向，urllib 随后会抛 ``HTTPError``——
+    它是 ``URLError`` 的子类，被 :meth:`FeishuClient._download` 的 except 接住，
+    结果就是「这张图不上传」，与网络失败同一条降级路径。
+    """
+
+    max_redirections = _MAX_IMAGE_REDIRECTS
+
+    # 参数表由 urllib 的 HTTPRedirectHandler 定义，签名不能改
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Any:
+        if _blocked_url(newurl):
+            logger.debug("图片重定向指向受限网段，已拒绝")
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +150,9 @@ class ClientConfig:
     #: 单次请求超时（秒）。SDK 把它同时用在同步（requests）与异步（httpx）两条
     #: 路径上，所以本类的全部方法都受它约束，不需要逐个方法单独设
     timeout_sec: float = float(DEFAULT_REQUEST_TIMEOUT_SEC)
+    #: 是否允许抓取内网 / 环回地址上的图片。默认 False——图片 URL 来自模型输出，
+    #: 一次 prompt injection 就能让 gateway 去探测内网，而它跑在用户自己的机器上
+    allow_private_image_hosts: bool = False
 
     def __post_init__(self) -> None:
         if not self.app_id.strip():
@@ -353,13 +436,24 @@ class FeishuClient:
         METRICS.incr("api.upload_image.error")
         return None
 
-    @staticmethod
-    def _download(url: str) -> bytes | None:
+    def _download(self, url: str) -> bytes | None:
+        """抓取远程图片.
+
+        图片 URL 来自模型输出的 markdown，所以它是**不可信输入**：一次 prompt
+        injection（读了恶意网页或文件）就能让 gateway 去请求任意地址，而 gateway
+        跑在用户自己的机器上、能看到内网。因此除了协议与体积限制，还要挡住内网
+        与环回地址，且重定向的每一跳都重新校验（见 :class:`_GuardedRedirectHandler`）。
+        """
         if not url.lower().startswith(("http://", "https://")):
+            return None
+        if not self.config.allow_private_image_hosts and _blocked_url(url):
+            logger.debug("图片地址指向受限网段，跳过上传")
+            METRICS.incr("api.upload_image.blocked")
             return None
         try:
             request = Request(url, headers={"User-Agent": "hermes-lark-streaming/1.0"})
-            with urlopen(request, timeout=_IMAGE_TIMEOUT_SEC) as response:  # noqa: S310 - 已限定 http(s)
+            opener = build_opener(_GuardedRedirectHandler())
+            with opener.open(request, timeout=_IMAGE_TIMEOUT_SEC) as response:  # noqa: S310 - 已限定 http(s)
                 if getattr(response, "status", 200) != 200:
                     return None
                 data = response.read(_MAX_IMAGE_BYTES + 1)
