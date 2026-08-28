@@ -174,6 +174,7 @@ streaming:
 
   resilience:
     bypass_after_failures: 5 # 连续收纳失败达此值即熔断，全面退回原生
+    request_timeout_sec: 30  # 单次飞书 API 超时；打字机是互斥刷新，挂住会积压增量
 
   selfheal:                  # 自愈：精准降级 + 经验继承
     enabled: true

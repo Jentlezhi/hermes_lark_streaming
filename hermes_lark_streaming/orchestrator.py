@@ -298,7 +298,10 @@ class Orchestrator:
                     return existing
                 client = FeishuClient(
                     ClientConfig(
-                        app_id=bot["app_id"], app_secret=bot["app_secret"], base_url=bot["base_url"]
+                        app_id=bot["app_id"],
+                        app_secret=bot["app_secret"],
+                        base_url=bot["base_url"],
+                        timeout_sec=float(self._cfg.request_timeout_sec),
                     )
                 )
                 self._clients[bot_id] = client
@@ -314,7 +317,12 @@ class Orchestrator:
             if not app_id or not app_secret:
                 raise RuntimeError("飞书凭据未配置")
             self._client = FeishuClient(
-                ClientConfig(app_id=app_id, app_secret=app_secret, base_url=self._cfg.base_url)
+                ClientConfig(
+                    app_id=app_id,
+                    app_secret=app_secret,
+                    base_url=self._cfg.base_url,
+                    timeout_sec=float(self._cfg.request_timeout_sec),
+                )
             )
             return self._client
 

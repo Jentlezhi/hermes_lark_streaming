@@ -52,7 +52,7 @@ except ImportError as _sdk_error:  # pragma: no cover - 取决于运行环境
     SDK_AVAILABLE = False
     SDK_IMPORT_ERROR = str(_sdk_error)
 
-from ..config import DEFAULT_DOMAIN
+from ..config import DEFAULT_DOMAIN, DEFAULT_REQUEST_TIMEOUT_SEC
 from ..observability import METRICS, logger, redact
 from .resilience import RETRY_DELAYS, TRANSIENT_CODES, FeishuAPIError
 
@@ -67,6 +67,9 @@ class ClientConfig:
     app_id: str
     app_secret: str
     base_url: str = DEFAULT_DOMAIN
+    #: 单次请求超时（秒）。SDK 把它同时用在同步（requests）与异步（httpx）两条
+    #: 路径上，所以本类的全部方法都受它约束，不需要逐个方法单独设
+    timeout_sec: float = float(DEFAULT_REQUEST_TIMEOUT_SEC)
 
     def __post_init__(self) -> None:
         if not self.app_id.strip():
@@ -97,6 +100,7 @@ class FeishuClient:
             .app_id(config.app_id)
             .app_secret(config.app_secret)
             .domain(domain)
+            .timeout(config.timeout_sec)
             .build()
         )
 

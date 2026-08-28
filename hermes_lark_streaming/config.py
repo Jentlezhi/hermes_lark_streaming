@@ -33,6 +33,16 @@ DEFAULT_ELEMENT_THRESHOLD = 180
 #: :attr:`Config.turn_ttl_sec` 兜底。
 DEFAULT_IDLE_FINALIZE_SEC = 90
 
+#: 单次飞书 API 请求的超时（秒）。
+#:
+#: 取 30 是为了与 lark-oapi 自己的默认值一致（``core/model/config.py`` 里
+#: ``timeout: Optional[float] = 30``），配置缺失时行为与不带这个特性时逐字相同。
+#:
+#: 值得知道的取舍：流式打字机每 100ms 就要发一次请求，而 :class:`FlushScheduler`
+#: 对刷新是互斥的——一个请求挂满 30 秒，这期间所有增量都在内存里积压。网络差
+#: 的环境可以调大，追求「宁可丢一帧也不要卡住」的可以调小到几秒。
+DEFAULT_REQUEST_TIMEOUT_SEC = 30
+
 #: 主配置缓存有效期（秒）。取 5 秒的理由：用户改完 config.yaml 切回飞书发下
 #: 一条消息，间隔本身就超过 5 秒，再短没有可感知收益；而每 5 秒一次 stat
 #: 的开销可以忽略。刻意不用文件监听——inotify/FSEvents 要引入平台差异与
@@ -489,6 +499,20 @@ class Config:
             5,
             minimum=1,
             maximum=1000,
+        )
+
+    @property
+    def request_timeout_sec(self) -> int:
+        """单次飞书 API 请求的超时（秒）.
+
+        下限 3 秒：再小连 TLS 握手加一次往返都未必够，只会把正常请求判成失败。
+        默认值与取舍见 :data:`DEFAULT_REQUEST_TIMEOUT_SEC`。
+        """
+        return _as_int(
+            _as_dict(self._streaming().get("resilience")).get("request_timeout_sec"),
+            DEFAULT_REQUEST_TIMEOUT_SEC,
+            minimum=3,
+            maximum=300,
         )
 
     # ── 自愈层（精准降级 + 经验继承）────────────────────────────────

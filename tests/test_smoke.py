@@ -1461,6 +1461,48 @@ def test_idle_finalize_sec_is_configurable() -> None:
     assert Config(home_with("坏值")).idle_finalize_sec == DEFAULT_IDLE_FINALIZE_SEC
 
 
+def test_request_timeout_is_configurable() -> None:
+    """飞书 API 单次请求超时可配，且默认值与 SDK 自己的默认对齐.
+
+    lark-oapi 的默认是 30 秒（``core/model/config.py`` 里
+    ``timeout: Optional[float] = 30``），本插件的默认必须与它一致——配置缺失时
+    行为要与不带这个特性时逐字相同。两处默认值漂移是这里真正要守的东西。
+
+    SDK 把 timeout 同时传给同步（requests）与异步（httpx）两条路径，所以设一次
+    就覆盖本插件的全部调用，不需要逐个方法单独设。
+    """
+    import tempfile
+    import textwrap
+
+    from hermes_lark_streaming.config import DEFAULT_REQUEST_TIMEOUT_SEC, Config
+    from hermes_lark_streaming.transport.client import ClientConfig
+
+    def home_with(value: object) -> Path:
+        home = Path(tempfile.mkdtemp())
+        (home / "config.yaml").write_text(
+            textwrap.dedent(f"""
+                streaming:
+                  enabled: true
+                  resilience:
+                    request_timeout_sec: {value}
+            """),
+            encoding="utf-8",
+        )
+        return home
+
+    # 传输层的默认值不得与配置层漂移
+    assert ClientConfig(app_id="cli_x", app_secret="s").timeout_sec == float(DEFAULT_REQUEST_TIMEOUT_SEC)
+    # 显式值原样带到传输层
+    assert ClientConfig(app_id="cli_x", app_secret="s", timeout_sec=7.0).timeout_sec == 7.0
+
+    assert Config(Path(tempfile.mkdtemp())).request_timeout_sec == DEFAULT_REQUEST_TIMEOUT_SEC
+    assert Config(home_with(8)).request_timeout_sec == 8
+    # 夹到下限：再小连一次 TLS 握手加往返都未必够，只会把正常请求判成失败
+    assert Config(home_with(1)).request_timeout_sec == 3
+    assert Config(home_with(9999)).request_timeout_sec == 300
+    assert Config(home_with("坏值")).request_timeout_sec == DEFAULT_REQUEST_TIMEOUT_SEC
+
+
 def test_finalized_card_summary_shows_terminal_state() -> None:
     """终态卡片的会话列表摘要必须是终态文案，不能停在「正在写」.
 
