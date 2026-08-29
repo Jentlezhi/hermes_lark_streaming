@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from .. import icons
 from ..core.segments import Segment, SegmentType
 from ..core.tooltrack import ToolDisplayStep
 from ..core.turn import REASON_INTERRUPTED, TIMEOUT_REASONS
@@ -92,6 +93,7 @@ def build_complete_card(
     is_aborted: bool = False,
     abort_reason: str = "",
     tool_dropped: int = 0,
+    marks: icons.IconSet = None,
 ) -> dict[str, Any]:
     """终态卡片 — 按 segment 顺序全量重建.
 
@@ -133,6 +135,7 @@ def build_complete_card(
                 text_size=body_text_size,
                 expanded=panel_expanded,
                 for_streaming=False,
+                marks=marks,
             )
         )
 
@@ -157,6 +160,7 @@ def build_complete_card(
                 is_error=is_error,
                 is_aborted=is_aborted,
                 abort_reason=abort_reason,
+                marks=marks,
             )
         )
 
@@ -191,6 +195,7 @@ def build_archived_card(
     panel_expanded: bool,
     show_tool_use: bool,
     width_mode: str,
+    marks: icons.IconSet = None,
 ) -> dict[str, Any]:
     """拆卡时封存旧卡.
 
@@ -211,6 +216,7 @@ def build_archived_card(
         header_enabled=False,
         width_mode=width_mode,
         summary=i18n.zh("card_archived"),
+        marks=marks,
     )
 
 
@@ -223,6 +229,7 @@ def build_cron_card(
     task_name: str = "",
     run_time: str = "",
     width_mode: str = "default",
+    marks: icons.IconSet = None,
 ) -> dict[str, Any]:
     """定时任务结果卡.
 
@@ -233,7 +240,7 @@ def build_cron_card(
     header_title = " · ".join(title_parts) if title_parts else i18n.zh("cron_title")
     return _build_standalone_card(
         content=content,
-        header_title=f"⏰ {header_title}",
+        header_title=f"{icons.with_space(marks, 'cron')}{header_title}",
         template="blue",
         width_mode=width_mode,
     )
@@ -244,9 +251,10 @@ def build_background_card(
     content: str,
     *,
     width_mode: str = "default",
+    marks: icons.IconSet = None,
 ) -> dict[str, Any]:
     """后台任务完成卡."""
-    title = f"✅ {i18n.zh('background_title')}"
+    title = f"{icons.with_space(marks, 'completed')}{i18n.zh('background_title')}"
     if preview.strip():
         title = f"{title}：{preview.strip()}"
     return _build_standalone_card(

@@ -17,6 +17,7 @@ import time
 from enum import StrEnum
 from typing import Any
 
+from .. import icons
 from ..config import Config
 from ..events import NoticeLevel
 from .segments import (
@@ -354,7 +355,13 @@ class Turn:
 
     # ── 会话列表状态摘要（治理「切走后看不出是否完成」）──────────────
 
-    def summary_text(self, cfg: Config, *, state_override: TurnState | None = None) -> str:
+    def summary_text(
+        self,
+        cfg: Config,
+        *,
+        state_override: TurnState | None = None,
+        marks: icons.IconSet = None,
+    ) -> str:
         """生成会话列表预览文案.
 
         飞书把 ``card.config.summary`` 显示在会话列表，这是唯一的跨会话
@@ -364,10 +371,16 @@ class Turn:
         ``FINALIZING``（真正的终态要等 ``update_card`` 成功才敢落定），而卡片上
         要写的是本次收卡的**目标**终态。不传它就会把已完成的任务在会话列表里
         显示成「✍️ 正在写」——恰好是本方法存在的理由被自己破坏掉。
+
+        ``marks`` 是符号表（见 :mod:`..icons`）。不传就用默认符号——本层不自己去
+        读配置，符号由编排层解析后递进来，这样领域层不必持有配置读取路径。
         """
         if not cfg.summary_enabled:
             return ""
         limit = cfg.summary_max_chars
+
+        def mark(key: str) -> str:
+            return icons.with_space(marks, key)
 
         with self.lock:
             state = state_override if state_override is not None else self.state
@@ -376,32 +389,32 @@ class Turn:
             last_text = self.segment_state.last_text()
 
         if state in (TurnState.IDLE, TurnState.CREATING):
-            return "⏳ 已收到，正在启动…"
+            return f"{mark('pending')}已收到，正在启动…"
 
         if state == TurnState.WAITING or pending is not None:
             if pending is not None and pending.kind == InteractionKind.APPROVAL:
-                return "⏸️ 等待你确认命令执行"
-            return "⏸️ 等待你的回复"
+                return f"{mark('waiting')}等待你确认命令执行"
+            return f"{mark('waiting')}等待你的回复"
 
         if state in (TurnState.STREAMING, TurnState.FINALIZING):
             if action:
-                return _clip(f"🛠️ {action}", limit)
+                return _clip(f"{mark('tool')}{action}", limit)
             if last_text.strip():
-                return _clip(f"✍️ {_flatten(last_text)}", limit)
-            return "💭 思考中…"
+                return _clip(f"{mark('writing')}{_flatten(last_text)}", limit)
+            return f"{mark('reasoning')}思考中…"
 
         if state == TurnState.COMPLETED:
             if last_text.strip():
-                return _clip(f"✅ {_flatten(last_text)}", limit)
-            return "✅ 已完成"
+                return _clip(f"{mark('completed')}{_flatten(last_text)}", limit)
+            return f"{mark('completed')}已完成"
         if state == TurnState.FAILED:
-            return "❌ 执行失败"
+            return f"{mark('failed')}执行失败"
         if state == TurnState.ABORTED:
             if self.abort_reason in TIMEOUT_REASONS:
-                return "⏱️ 已超时收尾"
+                return f"{mark('timeout')}已超时收尾"
             if self.abort_reason == REASON_INTERRUPTED:
-                return "⏭️ 已中断 · 新消息已接续"
-            return "⏹️ 已停止"
+                return f"{mark('interrupted')}已中断 · 新消息已接续"
+            return f"{mark('stopped')}已停止"
         return ""
 
 

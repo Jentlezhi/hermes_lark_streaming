@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
+from .. import icons
 from ..core.segments import InteractionKind, InteractionStatus, InteractionState, NoticeItem
 from ..core.tooltrack import ToolDisplayStep
 from ..core.turn import REASON_INTERRUPTED, TIMEOUT_REASONS
@@ -187,6 +188,7 @@ def reasoning_panel(
     expanded: bool = False,
     element_id: str | None = None,
     text_element_id: str | None = None,
+    marks: icons.IconSet = None,
 ) -> dict[str, Any]:
     if elapsed_ms > 0:
         duration = format_elapsed(elapsed_ms)
@@ -201,8 +203,9 @@ def reasoning_panel(
     if text_element_id:
         inner["element_id"] = text_element_id
 
+    mark = icons.with_space(marks, "reasoning")
     return collapsible_panel(
-        title_element=panel_title(f"💭 {zh_label}", f"💭 {en_label}"),
+        title_element=panel_title(f"{mark}{zh_label}", f"{mark}{en_label}"),
         elements=[inner],
         expanded=expanded,
         element_id=element_id,
@@ -210,12 +213,13 @@ def reasoning_panel(
     )
 
 
-def reasoning_title_patch(elapsed_ms: float) -> dict[str, Any]:
+def reasoning_title_patch(elapsed_ms: float, *, marks: icons.IconSet = None) -> dict[str, Any]:
     """思考面板终结时只更新标题（把「思考中」改成「思考了 N 秒」）."""
     duration = format_elapsed(elapsed_ms)
     zh_label = i18n.zh("thought_for").format(duration)
     en_label = i18n.en("thought_for").format(duration)
-    return {"header": {"title": panel_title(f"💭 {zh_label}", f"💭 {en_label}")}}
+    mark = icons.with_space(marks, "reasoning")
+    return {"header": {"title": panel_title(f"{mark}{zh_label}", f"{mark}{en_label}")}}
 
 
 # ── 工具面板 ──────────────────────────────────────────────────────
@@ -227,6 +231,7 @@ def tool_panel(
     expanded: bool = True,
     element_id: str | None = None,
     dropped: int = 0,
+    marks: icons.IconSet = None,
 ) -> dict[str, Any]:
     zh_parts = [i18n.zh("tool_use")]
     en_parts = [i18n.en("tool_use")]
@@ -255,8 +260,9 @@ def tool_panel(
             }
         )
 
+    mark = icons.with_space(marks, "tool")
     return collapsible_panel(
-        title_element=panel_title(f"🛠️ {' · '.join(zh_parts)}", f"🛠️ {' · '.join(en_parts)}"),
+        title_element=panel_title(f"{mark}{' · '.join(zh_parts)}", f"{mark}{' · '.join(en_parts)}"),
         elements=children,
         expanded=expanded,
         element_id=element_id,
@@ -334,26 +340,35 @@ def notice_block(
     is_review: bool,
     element_id: str | None = None,
     overflow: int = 0,
+    marks: icons.IconSet = None,
 ) -> dict[str, Any]:
     """把收纳来的提示渲染为一个紧凑块.
 
     多条提示合并进同一个元素，避免每条提示各占一个卡片元素而撑爆预算。
     """
+    #: 级别 → 符号表里的键。行首标记按级别分档，与整块前缀是两回事
+    level_keys = {
+        NoticeLevel.INFO: "level_info",
+        NoticeLevel.WARNING: "level_warning",
+        NoticeLevel.ERROR: "level_error",
+    }
     lines: list[str] = []
     for item in items:
-        token, color = _NOTICE_STYLE.get(item.level, _NOTICE_STYLE[NoticeLevel.INFO])
-        marker = {"info_outlined": "·", "warning_outlined": "⚠", "error_outlined": "✕"}.get(token, "·")
+        _token, color = _NOTICE_STYLE.get(item.level, _NOTICE_STYLE[NoticeLevel.INFO])
+        marker = icons.with_space(marks, level_keys.get(item.level, "level_info"))
         # 提示文本可能来自模型（子任务摘要）或 Hermes 状态消息，都是不可信输入。
         # 不转义标签起始符，一个 </font> 会提前闭合配色，而 `a < b` 这种更常见的
         # 写法会让飞书把后面的内容当未知标签吞掉——那是丢内容，不只是变丑
         text = escape_tags(item.text.replace("\n", " ").strip())
-        lines.append(f"<font color='{color}'>{marker} {text}</font>")
+        lines.append(f"<font color='{color}'>{marker}{text}</font>")
 
     if overflow > 0:
         lines.append(f"<font color='grey'>{i18n.zh('notice_overflow').format(overflow)}</font>")
 
-    prefix = "🧠" if is_review else "ℹ️"
+    prefix = icons.get(marks, "review" if is_review else "notice")
     content = f"{prefix} " + "\n".join(lines) if lines else prefix
+    if not prefix:
+        content = "\n".join(lines)
 
     element: dict[str, Any] = {
         "tag": "markdown",
@@ -368,17 +383,22 @@ def notice_block(
 # ── 交互块 ────────────────────────────────────────────────────────
 
 
-def interaction_block(state: InteractionState, *, element_id: str | None = None) -> dict[str, Any]:
+def interaction_block(
+    state: InteractionState,
+    *,
+    element_id: str | None = None,
+    marks: icons.IconSet = None,
+) -> dict[str, Any]:
     """交互状态块.
 
     首版只展示状态，不承载按钮——按钮仍由 Hermes 原生卡片提供，
     这里保证「卡片内能看到审批发生过、内容是什么、结果如何」。
     """
     if state.kind == InteractionKind.APPROVAL:
-        icon = "🔐"
+        mark = icons.with_space(marks, "approval")
         pending_key, resolved_key = "approval_pending", "approval_resolved"
     else:
-        icon = "❓"
+        mark = icons.with_space(marks, "clarify")
         pending_key, resolved_key = "clarify_pending", "clarify_resolved"
 
     if state.status == InteractionStatus.PENDING:
@@ -394,7 +414,7 @@ def interaction_block(state: InteractionState, *, element_id: str | None = None)
         status_text = i18n.zh("status_error")
         color = "red"
 
-    lines = [f"{icon} **{escape_inline(state.title)}** · <font color='{color}'>{status_text}</font>"]
+    lines = [f"{mark}**{escape_inline(state.title)}** · <font color='{color}'>{status_text}</font>"]
     if state.detail.strip():
         lines.append(f"<font color='grey'>{escape_inline(state.detail.strip())}</font>")
     if state.result.strip():
@@ -422,6 +442,7 @@ def footer_elements(
     is_error: bool = False,
     is_aborted: bool = False,
     abort_reason: str = "",
+    marks: icons.IconSet = None,
 ) -> list[dict[str, Any]]:
     payload = data or {}
     zh_lines: list[str] = []
@@ -431,7 +452,9 @@ def footer_elements(
         zh_parts: list[str] = []
         en_parts: list[str] = []
         for name in row:
-            zh_value, en_value = _footer_field(name, payload, is_error, is_aborted, show_label, abort_reason)
+            zh_value, en_value = _footer_field(
+                name, payload, is_error, is_aborted, show_label, abort_reason, marks
+            )
             if zh_value:
                 zh_parts.append(zh_value)
                 en_parts.append(en_value or zh_value)
@@ -466,17 +489,23 @@ def _footer_field(
     is_aborted: bool,
     show_label: bool,
     abort_reason: str = "",
+    marks: icons.IconSet = None,
 ) -> tuple[str | None, str | None]:
     if name == "status":
+
+        def styled(key: str, text_key: str) -> tuple[str, str]:
+            mark = icons.with_space(marks, key)
+            return f"{mark}{i18n.zh(text_key)}", f"{mark}{i18n.en(text_key)}"
+
         if is_error:
-            return f"❌ {i18n.zh('status_error')}", f"❌ {i18n.en('status_error')}"
+            return styled("failed", "status_error")
         if is_aborted:
             if abort_reason in TIMEOUT_REASONS:
-                return f"⏱️ {i18n.zh('status_timeout')}", f"⏱️ {i18n.en('status_timeout')}"
+                return styled("timeout", "status_timeout")
             if abort_reason == REASON_INTERRUPTED:
-                return f"⏭️ {i18n.zh('status_interrupted')}", f"⏭️ {i18n.en('status_interrupted')}"
-            return f"⏹️ {i18n.zh('status_stopped')}", f"⏹️ {i18n.en('status_stopped')}"
-        return f"✅ {i18n.zh('status_completed')}", f"✅ {i18n.en('status_completed')}"
+                return styled("interrupted", "status_interrupted")
+            return styled("stopped", "status_stopped")
+        return styled("completed", "status_completed")
 
     if name == "elapsed":
         duration = data.get("duration", 0)

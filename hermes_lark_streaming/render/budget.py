@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .. import icons
 from ..core.segments import Segment, SegmentType
 from ..core.tooltrack import ToolDisplayStep
 from . import elements
@@ -96,6 +97,7 @@ def add_segment_action(
     *,
     text_size: str,
     expanded: bool,
+    marks: icons.IconSet = None,
 ) -> dict[str, Any]:
     """构造「新增元素」action.
 
@@ -106,7 +108,9 @@ def add_segment_action(
         "params": {
             "type": "insert_before",
             "target_element_id": elements.LOADING_ELEMENT_ID,
-            "elements": [render_segment(seg, all_steps, text_size=text_size, expanded=expanded)],
+            "elements": [
+                render_segment(seg, all_steps, text_size=text_size, expanded=expanded, marks=marks)
+            ],
         },
     }
 
@@ -118,6 +122,7 @@ def render_segment(
     text_size: str,
     expanded: bool,
     for_streaming: bool = True,
+    marks: icons.IconSet = None,
 ) -> dict[str, Any]:
     """把 Segment 渲染为卡片元素.
 
@@ -133,6 +138,7 @@ def render_segment(
             expanded=expanded,
             element_id=element_id,
             text_element_id=seg.text_el_id if for_streaming else None,
+            marks=marks,
         )
 
     if seg.type == SegmentType.ANSWER:
@@ -143,7 +149,9 @@ def render_segment(
     if seg.type == SegmentType.TOOL:
         start = seg.tool_offset
         end = tool_segment_end(seg, all_steps)
-        return elements.tool_panel(all_steps[start:end], expanded=expanded, element_id=element_id)
+        return elements.tool_panel(
+            all_steps[start:end], expanded=expanded, element_id=element_id, marks=marks
+        )
 
     if seg.type in (SegmentType.NOTICE, SegmentType.REVIEW):
         return elements.notice_block(
@@ -151,10 +159,11 @@ def render_segment(
             is_review=seg.type == SegmentType.REVIEW,
             element_id=element_id,
             overflow=seg.overflow_count,
+            marks=marks,
         )
 
     if seg.type == SegmentType.INTERACTION and seg.interaction is not None:
-        return elements.interaction_block(seg.interaction, element_id=element_id)
+        return elements.interaction_block(seg.interaction, element_id=element_id, marks=marks)
 
     # 未知类型不应出现；返回占位而非抛错，避免单个坏段毁掉整张卡
     return elements.static_text(" ", text_size=text_size)
@@ -168,29 +177,36 @@ def update_element_action(element_id: str, partial: dict[str, Any]) -> dict[str,
     }
 
 
-def tool_update_action(*, element_id: str, steps: list[ToolDisplayStep], expanded: bool) -> dict[str, Any]:
-    panel = elements.tool_panel(steps, expanded=expanded)
+def tool_update_action(
+    *,
+    element_id: str,
+    steps: list[ToolDisplayStep],
+    expanded: bool,
+    marks: icons.IconSet = None,
+) -> dict[str, Any]:
+    panel = elements.tool_panel(steps, expanded=expanded, marks=marks)
     return update_element_action(
         element_id,
         {"elements": panel["elements"], "header": panel["header"]},
     )
 
 
-def notice_update_action(seg: Segment) -> dict[str, Any]:
+def notice_update_action(seg: Segment, *, marks: icons.IconSet = None) -> dict[str, Any]:
     block = elements.notice_block(
         seg.notices,
         is_review=seg.type == SegmentType.REVIEW,
         overflow=seg.overflow_count,
+        marks=marks,
     )
     return update_element_action(seg.el_id, {"content": block["content"]})
 
 
-def interaction_update_action(seg: Segment) -> dict[str, Any] | None:
+def interaction_update_action(seg: Segment, *, marks: icons.IconSet = None) -> dict[str, Any] | None:
     if seg.interaction is None:
         return None
-    block = elements.interaction_block(seg.interaction)
+    block = elements.interaction_block(seg.interaction, marks=marks)
     return update_element_action(seg.el_id, {"content": block["content"]})
 
 
-def reasoning_finalize_action(seg: Segment) -> dict[str, Any]:
-    return update_element_action(seg.el_id, elements.reasoning_title_patch(seg.elapsed_ms))
+def reasoning_finalize_action(seg: Segment, *, marks: icons.IconSet = None) -> dict[str, Any]:
+    return update_element_action(seg.el_id, elements.reasoning_title_patch(seg.elapsed_ms, marks=marks))

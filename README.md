@@ -155,6 +155,9 @@ streaming:
     show_label: false
   panel_expanded: false      # 完成态是否展开思考/工具面板
 
+  icons:                     # 卡片符号：只写想改的，其余用默认（见下方清单）
+    reasoning: "🤔"          # 空字符串 "" = 这个位置不要符号
+
   summary:                   # 会话列表状态摘要
     enabled: true
     max_chars: 60
@@ -193,6 +196,50 @@ streaming:
 `fields: [[status, elapsed, context, model], [usage]]`。Hermes 只为
 openai-codex / anthropic / openrouter 实现了额度接口，其余服务商（deepseek、
 本地模型等）查不到数据，此时该字段自动消失而不显示占位符。
+
+### 卡片符号清单
+
+`streaming.icons` 下可覆盖的键，共 19 个。只写想改的，其余仍用默认；写空字符串
+`""` 表示该位置不要符号（连它后面那个空格一起省掉）。未知键会被忽略。每个键的
+确切位置与出现时机在 `hermes_lark_streaming/icons.py` 里逐条注释了。
+
+**卡片正文的折叠面板**
+
+- `reasoning` 💭 — 思考面板标题（「正在思考…」/「思考过程」/「思考了 12.3s」三档共用）
+- `tool` 🛠️ — 工具面板标题（「工具调用 · N 步」）
+
+**提示块**（游离消息收纳的落点，多条提示合并在同一个元素里）
+
+- `notice` ℹ️ — 运行提示块的整块前缀（压缩、重试、限流、工作轮、超时说明）
+- `review` 🧠 — 记忆与改进块的整块前缀
+- `level_info` `·` / `level_warning` ⚠ / `level_error` ✕ — 块内**每一行**的级别标记
+
+**交互状态**（卡片只记录状态，按钮仍由 Hermes 原生卡提供）
+
+- `approval` 🔐 — 命令执行授权
+- `clarify` ❓ — 澄清提问
+
+**终态**（同一个符号在三处复用：卡片 footer、会话列表预览、子任务结果提示）
+
+- `completed` ✅ — 正常完成；子任务成功；后台任务完成卡的标题
+- `failed` ❌ — 执行失败；子任务失败
+- `timeout` ⏱️ — 插件自我保护收卡（空闲守护 / TTL 回收 / 容量淘汰）。**不代表任务失败**
+- `interrupted` ⏭️ — 被新消息接续
+- `stopped` ⏹️ — 用户 /stop；子任务被中断或取消
+
+**只出现在会话列表预览里**（飞书把 `card.config.summary` 显示在聊天列表）
+
+- `pending` ⏳ — 已收到、正在启动
+- `waiting` ⏸️ — 停在授权确认或澄清提问上
+- `writing` ✍️ — 模型正在写回答
+
+**其他**
+
+- `subagent` 🧩 — 子任务启动，以及终态无法识别时
+- `cron` ⏰ — 定时任务卡的标题
+
+`events/normalize.py` 里的 💾🧠📝 不在此列——那是识别 Hermes 记忆更新类消息的
+**分类正则**，不是展示用的；CLI 输出的 ✔✘ 显示在终端而非卡片，同样不参与。
 
 **改配置多数不必重启 gateway**：配置走 5 秒 TTL 缓存，改完最长 5 秒生效——
 `capture.*` 收纳开关、`native_chats`、`chat_bindings`、`footer.*`、`summary.*`、

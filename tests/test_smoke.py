@@ -393,6 +393,85 @@ def test_notice_text_cannot_break_out_of_font_tag() -> None:
     assert plain in notice_block([NoticeItem(text=plain, level=NoticeLevel.WARNING)], is_review=False)["content"]
 
 
+def test_card_icons_are_configurable() -> None:
+    """卡片符号可配，且默认值与配置化之前逐字相同.
+
+    这些符号原先散在 5 个文件的 31 个 f-string 里。集中之后最要紧的是**默认行为
+    不变**：不配任何东西时，每个位置显示的符号必须和硬编码时一模一样。
+    """
+    import tempfile
+    import textwrap
+
+    from hermes_lark_streaming import icons
+    from hermes_lark_streaming.config import Config
+    from hermes_lark_streaming.core.segments import InteractionKind, InteractionState, NoticeItem
+    from hermes_lark_streaming.core.turn import Turn, TurnState
+    from hermes_lark_streaming.events import NoticeLevel
+    from hermes_lark_streaming.render import card as card_mod
+    from hermes_lark_streaming.render import elements
+
+    def home(body: str = "") -> Path:
+        path = Path(tempfile.mkdtemp())
+        if body:
+            (path / "config.yaml").write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    # 默认表覆盖全部 19 个语义键，且都非空
+    assert len(icons.DEFAULT_ICONS) == 19
+    assert all(icons.DEFAULT_ICONS.values())
+
+    default = icons.resolve(Config(home()))
+    assert default == icons.DEFAULT_ICONS
+
+    # 默认行为与硬编码时逐字相同 —— 这几处是配置化前的原样
+    assert elements.reasoning_panel("想…", marks=default)["header"]["title"]["content"].startswith("💭 ")
+    assert elements.tool_panel([], marks=default)["header"]["title"]["content"].startswith("🛠️ ")
+    assert elements.notice_block(
+        [NoticeItem(text="压缩中", level=NoticeLevel.WARNING)], is_review=False, marks=default
+    )["content"].startswith("ℹ️ <font color='orange'>⚠ ")
+    assert elements.notice_block([NoticeItem(text="x")], is_review=True, marks=default)[
+        "content"
+    ].startswith("🧠 ")
+    assert elements.interaction_block(
+        InteractionState(kind=InteractionKind.APPROVAL, title="rm"), marks=default
+    )["content"].startswith("🔐 ")
+    assert elements._footer_field("status", {}, False, False, False, "", default)[0] == "✅ 已完成"
+    assert card_mod.build_cron_card("x", task_name="日报", marks=default)["header"]["title"][
+        "content"
+    ].startswith("⏰ ")
+
+    # 覆盖生效，未配的键保持默认，未知键忽略
+    custom = icons.resolve(
+        Config(
+            home("""
+                streaming:
+                  enabled: true
+                  icons:
+                    reasoning: "🤔"
+                    subagent: ""
+                    根本没这个键: "💀"
+            """)
+        )
+    )
+    assert custom["reasoning"] == "🤔"
+    assert custom["completed"] == icons.DEFAULT_ICONS["completed"]
+    assert "根本没这个键" not in custom
+    assert elements.reasoning_panel("想…", marks=custom)["header"]["title"]["content"].startswith("🤔 ")
+
+    # 空字符串 = 不要符号，且连尾随空格一起省掉，文案不会诡异地缩进一格
+    assert icons.with_space(custom, "subagent") == ""
+    assert icons.get(custom, "subagent") == ""
+
+    # 会话列表预览也走同一张表
+    turn = Turn(turn_key="t", message_id="m", chat_id="c")
+    turn.transition(TurnState.STREAMING)
+    cfg = Config(home())
+    assert turn.summary_text(cfg, marks=default) == "💭 思考中…"
+    assert turn.summary_text(cfg, marks=custom) == "🤔 思考中…"
+    # 不传 marks 时退回默认表：漏传只是用默认符号，不该抛错
+    assert turn.summary_text(cfg) == "💭 思考中…"
+
+
 def test_element_budget_estimation() -> None:
     """预算必须宁可高估：低估会导致整次更新失败而非截断."""
     from hermes_lark_streaming.core.segments import SegmentState

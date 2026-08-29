@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .. import icons
 from ..events import NoticeLevel
 from ..observability import logger
 from ..orchestrator import PUSH_REJECTED, Orchestrator
@@ -31,12 +32,13 @@ _SUBAGENT_WOVEN_FLAG = "_hls_subagent_woven"
 #: 织入前的原方法，供 :func:`uninstall_subagent_hook` 还原
 _originals: tuple[type, dict[str, Any]] | None = None
 
-#: 终态 -> (图标, 中文说明, 提示级别)
+#: 终态 -> (符号表键, 中文说明, 提示级别)。符号本身在 :mod:`..icons` 里，
+#: 这里只记键名——子任务的成功/失败/中断与卡片其他位置的同义符号共用一套配置
 _TERMINAL_STYLE: dict[str, tuple[str, str, NoticeLevel]] = {
-    "SUCCEEDED": ("✅", "子任务已完成", NoticeLevel.INFO),
-    "FAILED": ("❌", "子任务失败", NoticeLevel.ERROR),
-    "INTERRUPTED": ("⏹️", "子任务被中断", NoticeLevel.WARNING),
-    "CANCELLED": ("⏹️", "子任务已取消", NoticeLevel.WARNING),
+    "SUCCEEDED": ("completed", "子任务已完成", NoticeLevel.INFO),
+    "FAILED": ("failed", "子任务失败", NoticeLevel.ERROR),
+    "INTERRUPTED": ("stopped", "子任务被中断", NoticeLevel.WARNING),
+    "CANCELLED": ("stopped", "子任务已取消", NoticeLevel.WARNING),
 }
 
 #: 子任务目标在卡片上的展示上限。goal 可能是一整段需求描述
@@ -152,7 +154,8 @@ def _wrap_launch(orch: Orchestrator, original: Any) -> Any:
             model = str(getattr(handle, "model", "") or "")
             role = str(getattr(handle, "role", "") or "")
             detail = " · ".join(part for part in (role, model) if part)
-            text = f"🧩 子任务已启动：{goal}" if goal else "🧩 子任务已启动"
+            mark = icons.with_space(icons.resolve(orch.config), "subagent")
+            text = f"{mark}子任务已启动：{goal}" if goal else f"{mark}子任务已启动"
             if detail:
                 text = f"{text}（{detail}）"
             _push(orch, parent, text, NoticeLevel.INFO)
@@ -191,9 +194,12 @@ def _report_terminal(orch: Orchestrator, record: Any, goal: Any, parent: Any) ->
     state = getattr(record, "state", None)
     # SubagentState 是 str 枚举，取 .value；万一换了类型就退回 str()
     name = str(getattr(state, "value", state) or "").upper()
-    icon, label, level = _TERMINAL_STYLE.get(name, ("🧩", f"子任务结束（{name or '未知'}）", NoticeLevel.INFO))
+    marks = icons.resolve(orch.config)
+    icon_key, label, level = _TERMINAL_STYLE.get(
+        name, ("subagent", f"子任务结束（{name or '未知'}）", NoticeLevel.INFO)
+    )
 
-    parts = [f"{icon} {label}"]
+    parts = [f"{icons.with_space(marks, icon_key)}{label}"]
     title = _clip(goal or "", _GOAL_LIMIT)
     if title:
         parts.append(f"：{title}")

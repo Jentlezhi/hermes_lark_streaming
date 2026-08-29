@@ -417,6 +417,23 @@ class Config:
         """完成态卡片中推理面板与工具面板是否保持展开."""
         return _as_bool(self._streaming().get("panel_expanded"), False)
 
+    @property
+    def icons(self) -> dict[str, str]:
+        """卡片符号覆盖表 ``{语义键: 符号}``.
+
+        只做类型过滤，不校验键名——键名的合法性由
+        :func:`~hermes_lark_streaming.render.icons.resolve` 负责（它只认已知键，
+        未知键静默忽略）。两层职责分开：这里只保证拿到的是 ``str → str``。
+
+        空字符串是合法值，表示「这个位置不要符号」，所以不能顺手用 ``_as_str``
+        把空值当缺失处理。
+        """
+        raw = _as_dict(self._streaming().get("icons"))
+        return {
+            key: value for key, value in raw.items() if isinstance(key, str) and isinstance(value, str)
+        }
+
+
     # ── 会话列表状态摘要（治理「切走后看不出是否完成」）────────────
 
     @property

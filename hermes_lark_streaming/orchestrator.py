@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import __version__, render
+from . import __version__, icons, render
 from .config import Config, hermes_home
 from .core import (
     REASON_EVICTED,
@@ -328,6 +328,15 @@ class Orchestrator:
             )
             return self._client
 
+    def _marks(self) -> dict[str, str]:
+        """解析当前生效的卡片符号表.
+
+        每次渲染现取而不缓存：配置本身有 5 秒 TTL 缓存，这里只是复制一个 19 项的
+        字典，代价可以忽略；换来的是用户改完 ``config.yaml`` 发下一条消息就能看到
+        新符号，不必重启 gateway——试符号这件事本来就要靠反复看效果。
+        """
+        return icons.resolve(self._cfg)
+
     def is_native_chat(self, chat_id: str | None) -> bool:
         """该会话是否配置为完全不接管（走 Hermes 原生输出）."""
         if not chat_id:
@@ -494,7 +503,7 @@ class Orchestrator:
             card = render.build_streaming_card(
                 header_enabled=self._cfg.header_enabled,
                 width_mode=self._cfg.width_mode,
-                summary=turn.summary_text(self._cfg),
+                summary=turn.summary_text(self._cfg, marks=self._marks()),
             )
             card_id = await client.create_card(card)
             anchor = turn.anchor_id or turn.message_id
@@ -649,6 +658,8 @@ class Orchestrator:
         client = self._ensure_client(turn.chat_id)
         all_steps = turn.tools.build_display_steps()
         segments = turn.segment_state.segments
+        # 符号表每轮刷新取一次，本轮内保持一致；配置改了下一轮自然跟上
+        marks = self._marks()
 
         # ── 阶段一：结构性变更 ──
         actions: list[dict[str, Any]] = []
@@ -688,6 +699,7 @@ class Orchestrator:
                         all_steps,
                         text_size=self._cfg.body_text_size,
                         expanded=True,
+                        marks=marks,
                     )
                 )
                 continue
@@ -709,20 +721,23 @@ class Orchestrator:
                 end = render.tool_segment_end(seg, all_steps)
                 actions.append(
                     render.tool_update_action(
-                        element_id=seg.el_id, steps=all_steps[start:end], expanded=True
+                        element_id=seg.el_id,
+                        steps=all_steps[start:end],
+                        expanded=True,
+                        marks=marks,
                     )
                 )
                 touched.add(seg.el_id)
             elif seg.is_notice_kind and seg.dirty:
-                actions.append(render.notice_update_action(seg))
+                actions.append(render.notice_update_action(seg, marks=marks))
                 touched.add(seg.el_id)
             elif seg.type == SegmentType.INTERACTION and seg.dirty:
-                action = render.interaction_update_action(seg)
+                action = render.interaction_update_action(seg, marks=marks)
                 if action is not None:
                     actions.append(action)
                     touched.add(seg.el_id)
             elif seg.type == SegmentType.REASONING and seg.elapsed_ms > 0 and not seg.reasoning_finalized:
-                actions.append(render.reasoning_finalize_action(seg))
+                actions.append(render.reasoning_finalize_action(seg, marks=marks))
                 finalized.add(seg.el_id)
 
         if actions and not await self._apply_actions(
@@ -918,12 +933,13 @@ class Orchestrator:
 
         old_card_id = turn.card_id
         seal_segments = [seg for seg in segments[turn.split_index : split_index] if seg.created]
+        marks = self._marks()
 
         try:
             new_card = render.build_streaming_card(
                 header_enabled=self._cfg.header_enabled,
                 width_mode=self._cfg.width_mode,
-                summary=turn.summary_text(self._cfg),
+                summary=turn.summary_text(self._cfg, marks=marks),
             )
             new_card_id = await client.create_card(new_card)
             new_msg_id = await client.reply_with_card(turn.anchor_id or turn.message_id, new_card_id)
@@ -945,6 +961,7 @@ class Orchestrator:
                     panel_expanded=self._cfg.panel_expanded,
                     show_tool_use=self._cfg.show_tool_use,
                     width_mode=self._cfg.width_mode,
+                    marks=marks,
                 )
                 await client.update_card(old_card_id, archived, sequence=turn.next_sequence())
             except Exception:
@@ -1043,11 +1060,12 @@ class Orchestrator:
         必须说清「任务本身可能还在跑」——卡片停止跟踪与任务失败是两件事，
         混为一谈会让用户以为任务挂了而重复提问。
         """
+        mark = icons.with_space(self._marks(), "timeout")
         if reason == REASON_EXPIRED:
-            return f"⏱️ 本轮超过 {int(self._cfg.turn_ttl_sec)} 秒无更新，卡片停止跟踪（任务可能仍在运行）"
+            return f"{mark}本轮超过 {int(self._cfg.turn_ttl_sec)} 秒无更新，卡片停止跟踪（任务可能仍在运行）"
         if reason == REASON_EVICTED:
-            return f"⏱️ 同时进行的会话超过 {int(self._cfg.max_turns)} 个，本轮卡片停止跟踪（任务不受影响）"
-        return f"⏱️ 超过 {int(self._cfg.idle_finalize_sec)} 秒无更新，卡片自动收尾（任务可能仍在运行）"
+            return f"{mark}同时进行的会话超过 {int(self._cfg.max_turns)} 个，本轮卡片停止跟踪（任务不受影响）"
+        return f"{mark}超过 {int(self._cfg.idle_finalize_sec)} 秒无更新，卡片自动收尾（任务可能仍在运行）"
 
     def _ensure_duration_footer(self, turn: Turn) -> None:
         """中断 / 超时收卡时补上耗时.
@@ -1168,6 +1186,7 @@ class Orchestrator:
         )
 
         client = self._ensure_client(turn.chat_id)
+        marks = self._marks()
         card = render.build_complete_card(
             segments=turn.active_segments(),
             all_tool_steps=turn.tools.build_display_steps(),
@@ -1181,11 +1200,12 @@ class Orchestrator:
             show_tool_use=self._cfg.show_tool_use,
             header_enabled=self._cfg.header_enabled,
             width_mode=self._cfg.width_mode,
-            summary=turn.summary_text(self._cfg, state_override=final_state),
+            summary=turn.summary_text(self._cfg, state_override=final_state, marks=marks),
             is_error=is_error,
             is_aborted=is_aborted,
             abort_reason=turn.abort_reason,
             tool_dropped=turn.tools.dropped,
+            marks=marks,
         )
 
         streaming_closed = False
@@ -1260,7 +1280,11 @@ class Orchestrator:
         try:
             client = self._ensure_client(chat_id)
             card = render.build_cron_card(
-                content, task_name=task_name, run_time=run_time, width_mode=self._cfg.width_mode
+                content,
+                task_name=task_name,
+                run_time=run_time,
+                width_mode=self._cfg.width_mode,
+                marks=self._marks(),
             )
             await client.send_card(chat_id, card)
             METRICS.incr("card.cron")
@@ -1283,7 +1307,9 @@ class Orchestrator:
             return False
         try:
             client = self._ensure_client(chat_id)
-            card = render.build_background_card(preview, content, width_mode=self._cfg.width_mode)
+            card = render.build_background_card(
+                preview, content, width_mode=self._cfg.width_mode, marks=self._marks()
+            )
             await client.send_card(chat_id, card, reply_to_message_id=reply_to_message_id)
             METRICS.incr("card.background")
             return True
